@@ -1,25 +1,59 @@
 {
   "expo": {
-    "name": "ai-teacher-app",
-    "slug": "ai-teacher-app",
+    "name": "AI Teacher — Maya",
+    "slug": "ai-teacher-maya",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0B0F1A"
+    },
+    "assetBundlePatterns": [
+      "assets/**"
+    ],
+    "assets": [
+      "./assets/models/teacher_maya.glb"
+    ],
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": false,
+      "bundleIdentifier": "com.yourname.aiteacher",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Maya uses your camera to see what you're working on and help you in real time.",
+        "NSMicrophoneUsageDescription": "Maya listens to your questions so she can answer them.",
+        "NSPhotoLibraryUsageDescription": "Maya can look at photos of your notes to help you."
+      }
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0B0F1A"
       },
-      "predictiveBackGestureEnabled": false
+      "package": "com.yourname.aiteacher",
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO"
+      ]
     },
     "web": {
-      "favicon": "./assets/favicon.png"
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Maya uses your camera to see what you're working on."
+        }
+      ],
+      "expo-av"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "your-eas-project-id-here"
+      }
     }
   }
 }
