@@ -18,6 +18,7 @@ import { Asset } from 'expo-asset';
 import * as FileSystem from 'expo-file-system';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
+import { decode } from 'base64-arraybuffer';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 export type AnimationState =
@@ -146,7 +147,7 @@ export default function AvatarRenderer({
     mixer: THREE.AnimationMixer,
   ) => {
     // Resolve the bundled asset
-    const asset = Asset.fromModule(require('../../assets/models/teacher_maya.glb'));
+    const asset = Asset.fromModule(require('../../assets/models/teacher_maya_tiny.glb'));
     await asset.downloadAsync();
     const uri = asset.localUri ?? asset.uri;
 
@@ -154,19 +155,29 @@ export default function AvatarRenderer({
     const b64    = await FileSystem.readAsStringAsync(uri, {
       encoding: FileSystem.EncodingType.Base64,
     });
-    const binary = Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
+    const binary = decode(b64);
 
-    // Parse with GLTFLoader
-    const loader = new GLTFLoader();
+    // RN has a navigator object but no userAgent; GLTFLoader's constructor needs one
+      if (typeof navigator !== 'undefined' && !(navigator as any).userAgent) {
+        Object.defineProperty(navigator, 'userAgent', {
+          value: 'ReactNative',
+          configurable: true,
+        });
+      }
+
+      const loader = new GLTFLoader();
+      loader.register(() => ({
+      name: 'SkipTextures',
+      loadTexture: () => Promise.resolve(null as any),
+      }));
 
     await new Promise<void>((resolve, reject) => {
       loader.parse(binary, '', gltf => {
         const model = gltf.scene;
 
         // CC4 exports in centimetres → scale to metres
-        model.scale.setScalar(0.012);
-        // Position: nudge down so bust fills the portrait frame
-        model.position.set(0, -1.65, 0);
+        model.scale.setScalar(1);
+        model.position.set(0, 0, 0);
         model.frustumCulled = false;
         scene.add(model);
 
@@ -176,6 +187,7 @@ export default function AvatarRenderer({
           meshRefs.current.push(child);
           child.frustumCulled = false;
           child.castShadow    = true;
+          child.material = new THREE.MeshStandardMaterial({ color: '#d9a98a', roughness: 0.7 });
 
           // Build name → index map from morphTargetDictionary
           const dict = child.morphTargetDictionary;
@@ -213,16 +225,33 @@ export default function AvatarRenderer({
 
   // ── GL context ready ──────────────────────────────────────────────────────
   const onContextCreate = useCallback(async (gl: ExpoWebGLRenderingContext) => {
+  try {
+    console.log('[Avatar] 1 context ready');
     glRef.current = gl;
+    const origShaderLog  = gl.getShaderInfoLog.bind(gl);
+    const origProgramLog = gl.getProgramInfoLog.bind(gl);
+    gl.getShaderInfoLog  = (s: any) => origShaderLog(s)  ?? '';
+    gl.getProgramInfoLog = (p: any) => origProgramLog(p) ?? '';
     const W = gl.drawingBufferWidth;
     const H = gl.drawingBufferHeight;
 
-    // ── Renderer ─────────────────────────────────────────────────────────
+    // ── Renderer (with a shim canvas, since RN has no DOM) ───────────────
+    const canvas = {
+      width: W,
+      height: H,
+      clientWidth: W,
+      clientHeight: H,
+      style: {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as any;
+
     const renderer = new THREE.WebGLRenderer({
+      canvas,
       context: gl as unknown as WebGLRenderingContext,
       antialias: true,
     });
-    renderer.setSize(W, H);
+    renderer.setSize(W, H, false);   // false = don't touch canvas.style
     renderer.setPixelRatio(1);
     renderer.shadowMap.enabled   = true;
     renderer.shadowMap.type      = THREE.PCFSoftShadowMap;
@@ -236,58 +265,60 @@ export default function AvatarRenderer({
     scene.background = new THREE.Color('#0B0F1A');
     sceneRef.current = scene;
 
-    // ── Camera — bust portrait framing ────────────────────────────────────
+    // ── Camera: bust portrait framing ─────────────────────────────────────
     const camera = new THREE.PerspectiveCamera(28, W / H, 0.01, 100);
-    camera.position.set(0, 0.18, 2.8);
-    camera.lookAt(0, 0.1, 0);
+    camera.position.set(0, 1.5, 1.6);
+    camera.lookAt(0, 1.45, 0);
     cameraRef.current = camera;
 
     // ── Lighting ──────────────────────────────────────────────────────────
-    // Warm key from upper-left
-    const key = new THREE.DirectionalLight(0xFFF5E0, 2.2);
+    const key = new THREE.DirectionalLight(0xFFF5E0, 2.2);   // warm key, upper-left
     key.position.set(-1.5, 3, 2);
     key.castShadow = true;
     key.shadow.mapSize.set(1024, 1024);
     scene.add(key);
-    // Cool fill from right
-    const fill = new THREE.DirectionalLight(0xCCE0FF, 0.8);
+
+    const fill = new THREE.DirectionalLight(0xCCE0FF, 0.8);   // cool fill, right
     fill.position.set(2, 1.5, 1);
     scene.add(fill);
-    // Amber rim — separates avatar from dark bg
-    const rim = new THREE.DirectionalLight(0xF5A623, 0.6);
+
+    const rim = new THREE.DirectionalLight(0xF5A623, 0.6);    // amber rim light
     rim.position.set(0, 2, -3);
     scene.add(rim);
-    // Soft ambient
+
     scene.add(new THREE.AmbientLight(0x8090B0, 0.5));
 
     // ── Mixer ─────────────────────────────────────────────────────────────
     const mixer = new THREE.AnimationMixer(scene);
     mixerRef.current = mixer;
 
-    // ── Load model ────────────────────────────────────────────────────────
-    try {
-      await loadModel(scene, mixer);
-      scheduleBlink();
-      onReady?.();
-    } catch (err) {
-      console.error('[Avatar] load error:', err);
-      onError?.(err as Error);
-      return;
-    }
-
-    // ── Render loop ───────────────────────────────────────────────────────
+    // ── Start the render loop BEFORE loading, so a frame is always drawn ──
     const tick = () => {
       rafRef.current = requestAnimationFrame(tick);
       const delta = clockRef.current.getDelta();
       mixer.update(delta);
       applyMorphs();
       renderer.render(scene, camera);
-      // expo-gl: signal frame is done
-      gl.endFrameEXP?.();
+      gl.endFrameEXP();
     };
     tick();
 
-  }, [loadModel, applyMorphs, scheduleBlink, onReady, onError]);
+    // ── Load model, with a timeout so a hang becomes a visible error ──────
+    console.log('[Avatar] 2 scene built, loading model');
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Model load timed out after 45s')), 45000),
+    );
+    await Promise.race([loadModel(scene, mixer), timeout]);
+
+    console.log('[Avatar] 3 model loaded');
+    scheduleBlink();
+    onReady?.();
+    console.log('[Avatar] 4 ready');
+  } catch (err) {
+    console.error('[Avatar] fatal:', err);
+    onError?.(err instanceof Error ? err : new Error(String(err)));
+  }
+}, [loadModel, applyMorphs, scheduleBlink, onReady, onError]);
 
   // ── Sync animation state prop ─────────────────────────────────────────────
   useEffect(() => {

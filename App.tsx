@@ -4,7 +4,8 @@
  * Bootstraps navigation and global providers.
  * The avatar session screen is the heart of the app.
  */
-
+import 'react-native-url-polyfill/auto';
+import 'fast-text-encoding';
 import React from 'react';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
