@@ -1,14 +1,14 @@
 /**
  * AvatarRenderer
  * ──────────────
- * Renders teacher_maya.glb using expo-gl + Three.js directly.
+ * Renders teacher_maya_tiny.glb using expo-gl + Three.js directly.
  * No expo-three dependency — pure Three.js with the expo-gl context.
  *
  * GLB is loaded via expo-asset → base64 read → ArrayBuffer parse.
  * The GLTFLoader is imported from three/examples/jsm (bundled with three).
  *
- * Shape keys: all 148 CC4 morph targets accessible by name.
- * Animations: all 11 CC clips in the AnimationMixer.
+ * Shape keys: the ~43 CC4 morph targets kept by strip-morphs.mjs.
+ * Animations: all CC clips in the AnimationMixer.
  */
 
 import React, { useRef, useEffect, useCallback } from 'react';
@@ -19,6 +19,11 @@ import * as FileSystem from 'expo-file-system';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
 import { decode } from 'base64-arraybuffer';
+
+// ── Debug switches (set to false / remove once the avatar shows) ───────────
+const DEBUG_TEST_CUBE   = true;   // red cube beside the head: proves the renderer draws
+const DEBUG_NO_MORPHS   = true;  // true = drop morph targets (tests whether morphs break rendering)
+const DEBUG_PLAIN_SKIN  = true;   // true = replace heavy materials with a plain skin-colour material
 
 // ── Types ──────────────────────────────────────────────────────────────────
 export type AnimationState =
@@ -158,28 +163,32 @@ export default function AvatarRenderer({
     const binary = decode(b64);
 
     // RN has a navigator object but no userAgent; GLTFLoader's constructor needs one
-      if (typeof navigator !== 'undefined' && !(navigator as any).userAgent) {
-        Object.defineProperty(navigator, 'userAgent', {
-          value: 'ReactNative',
-          configurable: true,
-        });
-      }
+    if (typeof navigator !== 'undefined' && !(navigator as any).userAgent) {
+      Object.defineProperty(navigator, 'userAgent', {
+        value: 'ReactNative',
+        configurable: true,
+      });
+    }
 
-      const loader = new GLTFLoader();
-      loader.register(() => ({
+    const loader = new GLTFLoader();
+    loader.register(() => ({
       name: 'SkipTextures',
       loadTexture: () => Promise.resolve(null as any),
-      }));
+    }));
 
     await new Promise<void>((resolve, reject) => {
       loader.parse(binary, '', gltf => {
         const model = gltf.scene;
 
-        // CC4 exports in centimetres → scale to metres
+        // The GLB is already in metres (bbox 0 → 1.7 on Y)
         model.scale.setScalar(1);
         model.position.set(0, 0, 0);
         model.frustumCulled = false;
         scene.add(model);
+
+        // Where did the model actually land? Head should be near y ≈ 1.6
+        const box = new THREE.Box3().setFromObject(model);
+        console.log('[Avatar] bbox min', box.min.toArray(), 'max', box.max.toArray());
 
         // Collect skinned meshes + morph dictionaries
         model.traverse(child => {
@@ -187,7 +196,17 @@ export default function AvatarRenderer({
           meshRefs.current.push(child);
           child.frustumCulled = false;
           child.castShadow    = true;
-          child.material = new THREE.MeshStandardMaterial({ color: '#d9a98a', roughness: 0.7 });
+
+          if (DEBUG_PLAIN_SKIN) {
+            child.material = new THREE.MeshStandardMaterial({ color: '#d9a98a', roughness: 0.7 });
+          }
+
+          if (DEBUG_NO_MORPHS) {
+            child.geometry.morphAttributes = {};
+            child.morphTargetInfluences = undefined;
+            child.morphTargetDictionary = undefined;
+            return;
+          }
 
           // Build name → index map from morphTargetDictionary
           const dict = child.morphTargetDictionary;
@@ -202,14 +221,36 @@ export default function AvatarRenderer({
 
         // Register all animation clips
         gltf.animations.forEach(clip => {
-          const action = mixer.clipAction(clip);
-          action.setLoop(THREE.LoopRepeat, Infinity);
-          actionsRef.current.set(clip.name, action);
-        });
+  const before = clip.tracks.length;
+  clip.tracks = clip.tracks.filter(
+  t => !t.name.endsWith('.scale') && !t.name.endsWith('.position'),
+);
+  if (clip.name === 'CC_Breathing') {
+    console.log('[Avatar] tracks', before, '→', clip.tracks.length,
+      clip.tracks.slice(0, 6).map(t => t.name));
+  }
+  const action = mixer.clipAction(clip);
+  action.setLoop(THREE.LoopRepeat, Infinity);
+  actionsRef.current.set(clip.name, action);
+});
 
         // Log what we found (helpful for debugging)
         console.log('[Avatar] Clips:', [...actionsRef.current.keys()]);
         console.log('[Avatar] Shape keys:', [...morphIndices.current.keys()].length);
+
+        const logBones = (label: string) => {
+  model.updateMatrixWorld(true);
+  const v = new THREE.Vector3();
+  const box = new THREE.Box3();
+  let count = 0;
+  model.traverse(o => {
+    if ((o as THREE.Bone).isBone) { box.expandByPoint(o.getWorldPosition(v)); count++; }
+  });
+  const f = (a: number[]) => a.map(n => Math.round(n * 100) / 100);
+  console.log(`[Avatar] ${label}`, count, 'bones, box', f(box.min.toArray()), f(box.max.toArray()));
+};
+logBones('bones at start');
+setTimeout(() => logBones('bones after 1s'), 1000);
 
         // Start idle
         const idle = actionsRef.current.get(ANIMATION_MAP['idle']);
@@ -225,100 +266,122 @@ export default function AvatarRenderer({
 
   // ── GL context ready ──────────────────────────────────────────────────────
   const onContextCreate = useCallback(async (gl: ExpoWebGLRenderingContext) => {
-  try {
-    console.log('[Avatar] 1 context ready');
-    glRef.current = gl;
-    const origShaderLog  = gl.getShaderInfoLog.bind(gl);
-    const origProgramLog = gl.getProgramInfoLog.bind(gl);
-    gl.getShaderInfoLog  = (s: any) => origShaderLog(s)  ?? '';
-    gl.getProgramInfoLog = (p: any) => origProgramLog(p) ?? '';
-    const W = gl.drawingBufferWidth;
-    const H = gl.drawingBufferHeight;
+    try {
+      console.log('[Avatar] 1 context ready');
+      glRef.current = gl;
 
-    // ── Renderer (with a shim canvas, since RN has no DOM) ───────────────
-    const canvas = {
-      width: W,
-      height: H,
-      clientWidth: W,
-      clientHeight: H,
-      style: {},
-      addEventListener: () => {},
-      removeEventListener: () => {},
-    } as any;
+      // expo-gl can return undefined for empty info logs; Three calls .trim() on them
+      const origShaderLog  = gl.getShaderInfoLog.bind(gl);
+      const origProgramLog = gl.getProgramInfoLog.bind(gl);
+      gl.getShaderInfoLog  = (s: any) => origShaderLog(s)  ?? '';
+      gl.getProgramInfoLog = (p: any) => origProgramLog(p) ?? '';
 
-    const renderer = new THREE.WebGLRenderer({
-      canvas,
-      context: gl as unknown as WebGLRenderingContext,
-      antialias: true,
-    });
-    renderer.setSize(W, H, false);   // false = don't touch canvas.style
-    renderer.setPixelRatio(1);
-    renderer.shadowMap.enabled   = true;
-    renderer.shadowMap.type      = THREE.PCFSoftShadowMap;
-    renderer.outputColorSpace    = THREE.SRGBColorSpace;
-    renderer.toneMapping         = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.1;
-    rendererRef.current = renderer;
+      const W = gl.drawingBufferWidth;
+      const H = gl.drawingBufferHeight;
 
-    // ── Scene ─────────────────────────────────────────────────────────────
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color('#0B0F1A');
-    sceneRef.current = scene;
+      console.log('[Avatar] buffer', W, H, 'aspect', (W / H).toFixed(2));
 
-    // ── Camera: bust portrait framing ─────────────────────────────────────
-    const camera = new THREE.PerspectiveCamera(28, W / H, 0.01, 100);
-    camera.position.set(0, 1.5, 1.6);
-    camera.lookAt(0, 1.45, 0);
-    cameraRef.current = camera;
+      // ── Renderer (with a shim canvas, since RN has no DOM) ───────────────
+      const canvas = {
+        width: W,
+        height: H,
+        clientWidth: W,
+        clientHeight: H,
+        style: {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      } as any;
 
-    // ── Lighting ──────────────────────────────────────────────────────────
-    const key = new THREE.DirectionalLight(0xFFF5E0, 2.2);   // warm key, upper-left
-    key.position.set(-1.5, 3, 2);
-    key.castShadow = true;
-    key.shadow.mapSize.set(1024, 1024);
-    scene.add(key);
+      const renderer = new THREE.WebGLRenderer({
+        canvas,
+        context: gl as unknown as WebGLRenderingContext,
+        antialias: true,
+      });
+      renderer.setSize(W, H, false);   // false = don't touch canvas.style
+      renderer.setPixelRatio(1);
+      renderer.shadowMap.enabled   = true;
+      renderer.shadowMap.type      = THREE.PCFSoftShadowMap;
+      renderer.outputColorSpace    = THREE.SRGBColorSpace;
+      renderer.toneMapping         = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.1;
+      rendererRef.current = renderer;
 
-    const fill = new THREE.DirectionalLight(0xCCE0FF, 0.8);   // cool fill, right
-    fill.position.set(2, 1.5, 1);
-    scene.add(fill);
+      // Surface real shader compile errors instead of failing silently
+      renderer.debug.onShaderError = (g: any, program: any, vs: any, fs: any) => {
+        console.error('[Avatar] shader error VS:', g.getShaderInfoLog(vs));
+        console.error('[Avatar] shader error FS:', g.getShaderInfoLog(fs));
+        console.error('[Avatar] shader error program:', g.getProgramInfoLog(program));
+      };
 
-    const rim = new THREE.DirectionalLight(0xF5A623, 0.6);    // amber rim light
-    rim.position.set(0, 2, -3);
-    scene.add(rim);
+      // ── Scene ─────────────────────────────────────────────────────────────
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color('#0B0F1A');
+      sceneRef.current = scene;
 
-    scene.add(new THREE.AmbientLight(0x8090B0, 0.5));
+      // ── Camera: bust portrait framing ─────────────────────────────────────
+      const camera = new THREE.PerspectiveCamera(28, W / H, 0.01, 100);
+      camera.position.set(0, 1.5, 1.6);
+      camera.lookAt(0, 1.45, 0);
+      cameraRef.current = camera;
 
-    // ── Mixer ─────────────────────────────────────────────────────────────
-    const mixer = new THREE.AnimationMixer(scene);
-    mixerRef.current = mixer;
+      // ── Lighting ──────────────────────────────────────────────────────────
+      const key = new THREE.DirectionalLight(0xFFF5E0, 2.2);   // warm key, upper-left
+      key.position.set(-1.5, 3, 2);
+      key.castShadow = true;
+      key.shadow.mapSize.set(1024, 1024);
+      scene.add(key);
 
-    // ── Start the render loop BEFORE loading, so a frame is always drawn ──
-    const tick = () => {
-      rafRef.current = requestAnimationFrame(tick);
-      const delta = clockRef.current.getDelta();
-      mixer.update(delta);
-      applyMorphs();
-      renderer.render(scene, camera);
-      gl.endFrameEXP();
-    };
-    tick();
+      const fill = new THREE.DirectionalLight(0xCCE0FF, 0.8);   // cool fill, right
+      fill.position.set(2, 1.5, 1);
+      scene.add(fill);
 
-    // ── Load model, with a timeout so a hang becomes a visible error ──────
-    console.log('[Avatar] 2 scene built, loading model');
-    const timeout = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Model load timed out after 45s')), 45000),
-    );
-    await Promise.race([loadModel(scene, mixer), timeout]);
+      const rim = new THREE.DirectionalLight(0xF5A623, 0.6);    // amber rim light
+      rim.position.set(0, 2, -3);
+      scene.add(rim);
 
-    console.log('[Avatar] 3 model loaded');
-    scheduleBlink();
-    onReady?.();
-    console.log('[Avatar] 4 ready');
-  } catch (err) {
-    console.error('[Avatar] fatal:', err);
-    onError?.(err instanceof Error ? err : new Error(String(err)));
-  }
-}, [loadModel, applyMorphs, scheduleBlink, onReady, onError]);
+      scene.add(new THREE.AmbientLight(0x8090B0, 0.5));
+
+      // ── Debug: red cube next to where the head should be ──────────────────
+      if (DEBUG_TEST_CUBE) {
+        const testCube = new THREE.Mesh(
+          new THREE.BoxGeometry(0.2, 0.2, 0.2),
+          new THREE.MeshBasicMaterial({ color: 0xff0000 }),
+        );
+        testCube.position.set(0.3, 1.5, 0);
+        scene.add(testCube);
+      }
+
+      // ── Mixer ─────────────────────────────────────────────────────────────
+      const mixer = new THREE.AnimationMixer(scene);
+      mixerRef.current = mixer;
+
+      // ── Start the render loop BEFORE loading, so a frame is always drawn ──
+      const tick = () => {
+        rafRef.current = requestAnimationFrame(tick);
+        const delta = clockRef.current.getDelta();
+        mixer.update(delta);
+        applyMorphs();
+        renderer.render(scene, camera);
+        gl.endFrameEXP();
+      };
+      tick();
+
+      // ── Load model, with a timeout so a hang becomes a visible error ──────
+      console.log('[Avatar] 2 scene built, loading model');
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Model load timed out after 45s')), 45000),
+      );
+      await Promise.race([loadModel(scene, mixer), timeout]);
+
+      console.log('[Avatar] 3 model loaded');
+      scheduleBlink();
+      onReady?.();
+      console.log('[Avatar] 4 ready');
+    } catch (err) {
+      console.error('[Avatar] fatal:', err);
+      onError?.(err instanceof Error ? err : new Error(String(err)));
+    }
+  }, [loadModel, applyMorphs, scheduleBlink, onReady, onError]);
 
   // ── Sync animation state prop ─────────────────────────────────────────────
   useEffect(() => {
