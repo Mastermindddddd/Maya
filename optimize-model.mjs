@@ -5,7 +5,8 @@
 //    beside `root`, and the CC clips bake the drift into all of them), then drops tracks
 //    that never move the mesh or never leave the rest pose. ~2175 → ~200 tracks per clip.
 //    Then trims the frozen padding off each clip, keeps her feet planted at the rest
-//    stance, and eases each clip's end back into its start so loops don't snap.
+//    stance and centred, eases each clip's end back into its start so loops don't snap,
+//    and removes the clips' mouth animation (lip sync drives the mouth).
 //  • Morph targets: drops the NORMAL deltas and stores POSITION deltas sparse (most are zero).
 //  • Removes what the app never shows: cornea / eye-occlusion / tearline meshes, the unused
 //    CC_Base skeleton, vertex colours, and every texture except base colour.
@@ -130,26 +131,35 @@ const trimToMotion = clip => {
   if (end < clip.duration - 0.05) { clip.duration = end; clip.trim(); }
 };
 
-// The clips float her up to ~25 cm and bob her body around. Each frame, translate the
-// whole rig so the lower foot sits at the rest floor height and the feet stay centred
-// where they rest (smoothed over ±0.15 s so it never jitters).
+// The clips float her up to ~25 cm, and slide her hips and upper body up to ~27 cm sideways
+// (the pelvis hangs off `root`, the legs off the torso, so the two move independently).
+// Each frame, translate the whole rig so that:
+//  • height: the lower foot sits at the rest floor height (smoothed over ±0.15 s);
+//  • across/depth: her chest stays centred where it rests. That's a slow average (±0.75 s),
+//    so slides and constant offsets go but quick natural sways stay. The camera is a
+//    chest-up shot, so the chest is what has to stay in frame.
 const topBones = [...new Set(bones.map(([o]) => o))].filter(o => !o.parent?.isBone && deformBones.has(o.name));
-const SMOOTH = 4;  // frames each side
+const restChest = worldPos('DEF-spine003');
+const SMOOTH_HEIGHT = 4;   // frames each side
+const SMOOTH_CENTRE = 22;  // frames each side
+const movingAverage = (values, radius) => values.map((_, i) => {
+  let sum = 0, n = 0;
+  for (let j = Math.max(0, i - radius); j <= Math.min(values.length - 1, i + radius); j++) { sum += values[j]; n++; }
+  return sum / n;
+});
 const groundClip = clip => {
   const times = grid(clip.duration);
-  const raw = [], local = topBones.map(() => []);
-  const restMid = restFeet.l.clone().add(restFeet.r).multiplyScalar(0.5);
-  samplePoses(clip, times, i => {
-    const l = worldPos('DEF-footL'), r = worldPos('DEF-footR');
-    const mid = l.clone().add(r).multiplyScalar(0.5);
-    raw.push(new THREE.Vector3(restMid.x - mid.x, Math.min(restFeet.l.y, restFeet.r.y) - Math.min(l.y, r.y), restMid.z - mid.z));
+  const dx = [], dy = [], dz = [], local = topBones.map(() => []);
+  const restFloor = Math.min(restFeet.l.y, restFeet.r.y);
+  samplePoses(clip, times, () => {
+    const chest = worldPos('DEF-spine003');
+    dx.push(restChest.x - chest.x);
+    dy.push(restFloor - Math.min(worldPos('DEF-footL').y, worldPos('DEF-footR').y));
+    dz.push(restChest.z - chest.z);
     topBones.forEach((b, k) => local[k].push(b.position.clone()));
   });
-  const offsets = raw.map((_, i) => {
-    const sum = new THREE.Vector3(); let n = 0;
-    for (let j = Math.max(0, i - SMOOTH); j <= Math.min(raw.length - 1, i + SMOOTH); j++) { sum.add(raw[j]); n++; }
-    return sum.divideScalar(n);
-  });
+  const sx = movingAverage(dx, SMOOTH_CENTRE), sy = movingAverage(dy, SMOOTH_HEIGHT), sz = movingAverage(dz, SMOOTH_CENTRE);
+  const offsets = times.map((_, i) => new THREE.Vector3(sx[i], sy[i], sz[i]));
   // The top-level bones sit directly under the (identity) armature, so a world offset is a local one
   const timesArr = new Float32Array(times);
   topBones.forEach((b, k) => {
@@ -186,9 +196,20 @@ const makeSeamless = clip => {
   });
 };
 
+// The clips' mouth animation wasn't made for this face rig: it purses and twists the lips
+// without ever opening the jaw. The mouth is driven by lip sync instead, so drop it.
+// (Eyes, lids and brows keep their animation.)
+const MOUTH = /jaw|chin|lip|cheek|nose|mouth|teeth|tongue/i;
+const mouthBones = new Set();
+byName.get('ORG-face').traverse(o => { if (o.isBone && MOUTH.test(o.name)) mouthBones.add(o.name); });
+const dropMouth = clip => {
+  clip.tracks = clip.tracks.filter(t => !mouthBones.has(t.name.substring(0, t.name.lastIndexOf('.'))));
+};
+
 gltf.animations.forEach(clip => {
   removeRootMotion(clip);
   pruneTracks(clip);
+  dropMouth(clip);
   if (clip.tracks.length === 0) return;
   trimToMotion(clip);
   groundClip(clip);

@@ -28,7 +28,7 @@ import { useSessionStore } from '../store/sessionStore';
 
 // ── Debug / tuning switches ────────────────────────────────────────────────
 const DEBUG_NO_ANIMATION    = false;  // true = never play clips (model stays in rest pose)
-const DEBUG_NO_MORPHS       = true;   // true = ignore morph targets (no blink / lip shapes; the jaw still moves). Flip to false to test morphs
+const DEBUG_NO_MORPHS       = false;  // true = ignore morph targets (no blink / lip shapes / expressions; the jaw still moves)
 const DEBUG_PLAIN_SKIN      = false;  // true = plain colours per material instead of the GLB's base-colour textures
 const TARGET_FPS            = 60;     // cap the render/animation rate; drop to 30 if the phone runs hot or the UI gets sluggish
 
@@ -73,6 +73,7 @@ interface Props {
   expression?:     ExpressionWeights;
   onReady?:        () => void;
   onError?:        (err: Error) => void;
+  onGestureFinished?: () => void;  // a one-shot gesture (nod, wave…) ended and she went back to her loop
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -83,15 +84,20 @@ const LOOPING_STATES = new Set<AnimationState>(['idle', 'listening', 'talking', 
 const LOOPING_CLIPS  = new Set([...LOOPING_STATES].map(state => ANIMATION_MAP[state]));
 const BLINK_INTERVAL = 4000;
 const BLINK_DURATION = 120;
-const MORPH_LERP     = 0.18;   // smoothing for expressions
-const VISEME_LERP    = 0.55;   // visemes change every ~50ms, so they need much faster smoothing
+// Smoothing time constants (seconds), so they're the same at any frame rate
+const MORPH_TAU      = 0.12;   // expressions
+const VISEME_TAU     = 0.05;   // mouth shapes change every ~60ms while speaking
+const BLINK_TAU      = 0.03;   // a blink lasts 120ms, so it has to close fast
 const VISEME_NAMES   = new Set<string>(SHAPE_KEYS.visemes);
+const BLINK_NAMES    = new Set<string>(['Eye_Blink_L', 'Eye_Blink_R']);
+// The two talking clips alternate each loop, so talking doesn't repeat every 4 s
+const TALK_ALTERNATE: Record<string, string> = { CC_Talking: 'CC_Talking2', CC_Talking2: 'CC_Talking' };
 
 // Jaw: how far each viseme opens the mouth (0–1), and the angle at 1
 const JAW_MAX_ANGLE = THREE.MathUtils.degToRad(14);
 const JAW_OPEN: Record<string, number> = {
-  V_Open: 1, V_Tight_O: 0.5, V_Wide: 0.4, V_Tight: 0.35,
-  V_Affricate: 0.25, V_Lip_Open: 0.2, V_Dental_Lip: 0.15, V_Explosive: 0.1,
+  V_Open: 1, V_Tight_O: 0.6, V_Wide: 0.55, V_Tight: 0.45,
+  V_Explosive: 0.15, V_Affricate: 0.12, V_Lip_Open: 0.15, V_Dental_Lip: 0.1,
 };
 // Rigify face bones that follow the jaw, and by how much (lips/cheeks only partly)
 const JAW_FOLLOW: Record<string, number> = {
@@ -413,12 +419,88 @@ const makeJawRig = (model: THREE.Object3D): JawRig | null => {
   };
 };
 
+// ── Life: small head movements and eye glances ─────────────────────────────
+// Clips loop, so on their own she repeats exactly. This adds slow, never-repeating
+// head motion and quick eye glances on top. The head skin (DEF-spine… chain) and the
+// face (ORG-spine… > ORG-face) hang off separate chains in this rig, so a head turn
+// rotates both by the same world rotation about the same pivot.
+const HEAD_SWAY   = THREE.MathUtils.degToRad(2.2);  // idle amplitude; 1.6× while talking
+const EYE_RANGE   = THREE.MathUtils.degToRad(6);
+const SACCADE_TAU = 0.035;  // eye glances are quick
+
+type LifeRig = { restore: () => void; apply: (time: number, dt: number, talking: boolean) => void };
+
+const makeLifeRig = (model: THREE.Object3D): LifeRig | null => {
+  const bones = ['DEF-spine006', 'ORG-spine006', 'MCH-eyeL', 'MCH-eyeR'].map(n => model.getObjectByName(n));
+  if (bones.some(b => !b?.parent)) return null;
+  const [headSkin, headFace, eyeL, eyeR] = bones as THREE.Object3D[];
+  const saved = bones.map(() => ({ p: new THREE.Vector3(), q: new THREE.Quaternion(), s: new THREE.Vector3() }));
+  let applied = false;
+
+  const gaze = new THREE.Vector2(), gazeTarget = new THREE.Vector2();
+  let nextGlance = 0;
+  const pivot = new THREE.Vector3(), q = new THREE.Quaternion(), euler = new THREE.Euler();
+  const m = new THREE.Matrix4(), step = new THREE.Matrix4();
+
+  // Rotates a bone by world rotation `rot` about world point `p`, by rewriting its local transform
+  const rotateInWorld = (bone: THREE.Object3D, p: THREE.Vector3, rot: THREE.Quaternion) => {
+    const parent = bone.parent!;
+    parent.updateWorldMatrix(true, false);
+    m.compose(bone.position, bone.quaternion, bone.scale).premultiply(parent.matrixWorld);
+    m.premultiply(step.makeTranslation(-p.x, -p.y, -p.z))
+     .premultiply(step.makeRotationFromQuaternion(rot))
+     .premultiply(step.makeTranslation(p.x, p.y, p.z));
+    m.premultiply(step.copy(parent.matrixWorld).invert()).decompose(bone.position, bone.quaternion, bone.scale);
+  };
+  // Smooth pseudo-random wave in −1…1: sines at unrelated frequencies never line up into a loop
+  const wave = (t: number, a: number, b: number, c: number) =>
+    (Math.sin(t * a) + 0.6 * Math.sin(t * b + 1.3) + 0.35 * Math.sin(t * c + 2.1)) / 1.95;
+
+  return {
+    // Called before mixer.update; restores the pre-offset pose (the mixer skips unchanged values)
+    restore: () => {
+      if (!applied) return;
+      bones.forEach((b, i) => { b!.position.copy(saved[i].p); b!.quaternion.copy(saved[i].q); b!.scale.copy(saved[i].s); });
+      applied = false;
+    },
+    apply: (t, dt, talking) => {
+      bones.forEach((b, i) => { saved[i].p.copy(b!.position); saved[i].q.copy(b!.quaternion); saved[i].s.copy(b!.scale); });
+      applied = true;
+
+      const amp   = HEAD_SWAY * (talking ? 1.6 : 1);
+      const yaw   = amp * wave(t, 0.37, 0.83, 1.71);
+      const pitch = amp * 0.7 * wave(t + 11, 0.43, 0.97, 1.93);
+      const roll  = amp * 0.45 * wave(t + 23, 0.29, 0.71, 1.37);
+      q.setFromEuler(euler.set(pitch, yaw, roll, 'YXZ'));
+      headSkin.getWorldPosition(pivot);
+      rotateInWorld(headSkin, pivot, q);
+      rotateInWorld(headFace, pivot, q);
+
+      // Mostly look at the student; now and then glance away
+      if (t >= nextGlance) {
+        const away = Math.random() < 0.35;
+        const spread = away ? 1 : 0.2;
+        gazeTarget.set((Math.random() * 2 - 1) * EYE_RANGE * spread, away ? (Math.random() * 2 - 1) * EYE_RANGE * 0.5 : 0);
+        nextGlance = t + 0.8 + Math.random() * 2.2;
+      }
+      gaze.lerp(gazeTarget, 1 - Math.exp(-dt / SACCADE_TAU));
+      // The eyes cancel most of the head turn, so her gaze stays steady
+      q.setFromEuler(euler.set(gaze.y - pitch * 0.7, gaze.x - yaw * 0.7, 0, 'YXZ'));
+      for (const eye of [eyeL, eyeR]) {
+        eye.getWorldPosition(pivot);
+        rotateInWorld(eye, pivot, q);
+      }
+    },
+  };
+};
+
 // ── Component ──────────────────────────────────────────────────────────────
 export default function AvatarRenderer({
   animationState = 'idle',
   expression     = {},
   onReady,
   onError,
+  onGestureFinished,
 }: Props) {
   const glRef            = useRef<ExpoWebGLRenderingContext | null>(null);
   const rendererRef      = useRef<THREE.WebGLRenderer | null>(null);
@@ -435,7 +517,10 @@ export default function AvatarRenderer({
   const targetMorphs     = useRef<Map<string, number>>(new Map());
   const currentMorphs    = useRef<Map<string, number>>(new Map());
   const jawRef           = useRef<JawRig | null>(null);
+  const lifeRef          = useRef<LifeRig | null>(null);
   const avatarRef        = useRef<AvatarModel | null>(null);
+  const gestureDoneRef   = useRef(onGestureFinished);
+  gestureDoneRef.current = onGestureFinished;
   const animStateRef     = useRef<AnimationState>(animationState);
   const baseStateRef     = useRef<AnimationState>('idle');
   const blinkTimer       = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -447,12 +532,12 @@ export default function AvatarRenderer({
 
   // Smooths every named weight once per frame and writes it to the meshes.
   // Returns how far the jaw should open (0–1) from the current visemes.
-  const applyMorphs = useCallback(() => {
+  const applyMorphs = useCallback((dt: number) => {
     let jaw = 0;
     targetMorphs.current.forEach((target, name) => {
       const current = currentMorphs.current.get(name) ?? 0;
-      const lerp    = VISEME_NAMES.has(name) ? VISEME_LERP : MORPH_LERP;
-      const next    = current + (target - current) * lerp;
+      const tau     = VISEME_NAMES.has(name) ? VISEME_TAU : BLINK_NAMES.has(name) ? BLINK_TAU : MORPH_TAU;
+      const next    = current + (target - current) * (1 - Math.exp(-dt / tau));
       currentMorphs.current.set(name, next);
       jaw += next * (JAW_OPEN[name] ?? 0);
     });
@@ -500,7 +585,10 @@ export default function AvatarRenderer({
   const switchAnimation = useCallback((state: AnimationState) => {
     if (DEBUG_NO_ANIMATION) return;
     if (LOOPING_STATES.has(state)) baseStateRef.current = state;
-    playClip(ANIMATION_MAP[state]);
+    const clipName = ANIMATION_MAP[state];
+    // Already talking on the other talking clip: keep going rather than crossfading
+    if (currentActionRef.current?.getClip().name === TALK_ALTERNATE[clipName]) return;
+    playClip(clipName);
   }, [playClip]);
 
   // ── Load GLB ──────────────────────────────────────────────────────────────
@@ -532,10 +620,17 @@ export default function AvatarRenderer({
       actionsRef.current.set(clip.name, action);
     });
     mixer.addEventListener('finished', e => {
-      if (e.action === currentActionRef.current) playClip(ANIMATION_MAP[baseStateRef.current]);
+      if (e.action !== currentActionRef.current) return;
+      playClip(ANIMATION_MAP[baseStateRef.current]);
+      gestureDoneRef.current?.();
+    });
+    mixer.addEventListener('loop', e => {
+      const next = TALK_ALTERNATE[e.action.getClip().name];
+      if (next && e.action === currentActionRef.current) playClip(next);
     });
 
-    jawRef.current = makeJawRig(avatar.model);
+    jawRef.current  = makeJawRig(avatar.model);
+    lifeRef.current = makeLifeRig(avatar.model);
 
     console.log('[Avatar] Clips:', [...actionsRef.current.keys()]);
     console.log('[Avatar] Meshes with shape keys:', morphIndices.current.size);
@@ -631,8 +726,11 @@ export default function AvatarRenderer({
         lastFrame = now;
         const delta = Math.min(clockRef.current.getDelta(), MAX_DELTA);
         jawRef.current?.restore();
+        lifeRef.current?.restore();
         mixer.update(delta);
-        const jaw = applyMorphs();
+        const jaw     = applyMorphs(delta);
+        const talking = !!TALK_ALTERNATE[ANIMATION_MAP[baseStateRef.current]];
+        lifeRef.current?.apply(now / 1000, delta, talking);
         jawRef.current?.open(jaw * JAW_MAX_ANGLE);
         renderer.render(scene, camera);
         gl.endFrameEXP();

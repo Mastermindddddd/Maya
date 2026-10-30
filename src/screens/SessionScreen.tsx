@@ -12,7 +12,7 @@
  * top 65% of screen, controls occupy the bottom 35%.
  */
 
-import React, { useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet, Animated,
   ScrollView, Easing, Platform, Dimensions,
@@ -24,6 +24,7 @@ import { RootStackParamList } from '../../App';
 
 import AvatarRenderer, { AnimationState } from '../components/AvatarRenderer';
 import LoadingOverlay from '../components/LoadingOverlay';
+import { useLipSync } from '../engine/LipSyncEngine';
 import {
   useSessionStore,
   studentStartsSpeaking,
@@ -90,6 +91,22 @@ export default function SessionScreen({ navigation, route }: Props) {
     setStudentName(studentName);
   }, [studentName, setStudentName]);
 
+  // ── Maya speaks: transcript + talking animation + lip sync ─────────────
+  // Speech ends when the lip sync does (until real TTS audio is wired up).
+  const { speak, stopSpeaking } = useLipSync();
+  const speechTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tutorSays = useCallback((text: string) => {
+    addMessage({ speaker: 'tutor', text });
+    tutorStartsSpeaking();
+    const durationMs = speak(text);
+    if (speechTimer.current) clearTimeout(speechTimer.current);
+    speechTimer.current = setTimeout(tutorFinishedSpeaking, durationMs + 150);
+  }, [addMessage, speak]);
+  useEffect(() => () => {
+    if (speechTimer.current) clearTimeout(speechTimer.current);
+    stopSpeaking();
+  }, [stopSpeaking]);
+
   // ── Mic pulse animation ───────────────────────────────────────────────
   useEffect(() => {
     if (phase === 'listening') {
@@ -118,10 +135,7 @@ export default function SessionScreen({ navigation, route }: Props) {
     setPhase('idle');
     // Greet the student
     setTimeout(() => {
-      addMessage({ speaker: 'tutor', text: `Hi ${studentName}! I'm Maya, your tutor. What are we working on today?` });
-      tutorStartsSpeaking();
-      // Simulate end of speech for prototype
-      setTimeout(tutorFinishedSpeaking, 3000);
+      tutorSays(`Hi ${studentName}! I'm Maya, your tutor. What are we working on today?`);
     }, 800);
   };
 
@@ -135,9 +149,7 @@ export default function SessionScreen({ navigation, route }: Props) {
       tutorIsThinking();
       // Simulate LLM + TTS for prototype
       setTimeout(() => {
-        addMessage({ speaker: 'tutor', text: "Of course! A quadratic equation has the form ax² + bx + c = 0. Let's start with a simple example — can you tell me what you already know about solving them?" });
-        tutorStartsSpeaking();
-        setTimeout(tutorFinishedSpeaking, 4000);
+        tutorSays("Of course! A quadratic equation has the form ax² + bx + c = 0. Let's start with a simple example — can you tell me what you already know about solving them?");
       }, 1800);
     } else if (phase === 'idle') {
       studentStartsSpeaking();
@@ -156,6 +168,8 @@ export default function SessionScreen({ navigation, route }: Props) {
           expression={expression}
           onReady={handleAvatarReady}
           onError={(err) => { console.error(err); setPhase('error'); }}
+          // Back to the phase's animation, so the gesture chip un-highlights and can be tapped again
+          onGestureFinished={() => setPhase(useSessionStore.getState().phase)}
         />
 
         {/* Loading overlay */}
@@ -223,7 +237,10 @@ export default function SessionScreen({ navigation, route }: Props) {
             <TouchableOpacity
               key={state}
               style={[s.animChip, animationState === state && s.animChipActive]}
-              onPress={() => useSessionStore.getState().setAnimation(state)}
+              // "Talk" makes her actually speak a line; the others just play the animation
+              onPress={() => state === 'talking'
+                ? tutorSays("Let's try one together. If x squared equals nine, then x can be three, or minus three.")
+                : useSessionStore.getState().setAnimation(state)}
             >
               <Text style={[s.animChipText, animationState === state && s.animChipTextActive]}>
                 {label}
