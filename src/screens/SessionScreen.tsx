@@ -75,7 +75,6 @@ export default function SessionScreen({ navigation, route }: Props) {
   // Global session state
   const phase          = useSessionStore(s => s.phase);
   const animationState = useSessionStore(s => s.animationState);
-  const visemeWeights  = useSessionStore(s => s.visemeWeights);
   const expression     = useSessionStore(s => s.expression);
   const messages       = useSessionStore(s => s.messages);
   const isAvatarReady  = useSessionStore(s => s.isAvatarReady);
@@ -154,7 +153,6 @@ export default function SessionScreen({ navigation, route }: Props) {
       <View style={[s.avatarContainer, { height: AVATAR_HEIGHT }]}>
         <AvatarRenderer
           animationState={animationState}
-          visemeWeights={visemeWeights}
           expression={expression}
           onReady={handleAvatarReady}
           onError={(err) => { console.error(err); setPhase('error'); }}
