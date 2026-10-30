@@ -6,14 +6,15 @@
  * generous type scale — feels like a serious learning product, not a game.
  */
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
-  KeyboardAvoidingView, Platform, Animated, Easing,
+  KeyboardAvoidingView, Platform, Animated, Easing, InteractionManager,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StackNavigationProp } from '@react-navigation/stack';
 import { RootStackParamList } from '../../App';
+import { preloadAvatar } from '../components/AvatarRenderer';
 
 type Props = {
   navigation: StackNavigationProp<RootStackParamList, 'Home'>;
@@ -35,6 +36,15 @@ export default function HomeScreen({ navigation }: Props) {
   const [name, setName]     = useState('');
   const [focused, setFocused] = useState(false);
   const scaleAnim = React.useRef(new Animated.Value(1)).current;
+
+  // Load the avatar while the student types their name, so the session opens quickly.
+  // Errors are ignored here; the session screen retries and reports them.
+  useEffect(() => {
+    const task = InteractionManager.runAfterInteractions(() => {
+      preloadAvatar().catch(() => {});
+    });
+    return () => task.cancel();
+  }, []);
 
   const handleStart = () => {
     const trimmed = name.trim() || 'Student';

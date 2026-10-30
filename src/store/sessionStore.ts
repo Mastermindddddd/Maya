@@ -183,7 +183,7 @@ export function tutorNods(long = false) {
   store.setExpression({ 'Mouth_Smile_L': 0.4, 'Mouth_Smile_R': 0.4 });
   // Return to previous state after nod
   setTimeout(() => {
-    store.setPhase(store.phase);
+    store.setPhase(useSessionStore.getState().phase);  // the phase now, not when the gesture started
     store.setExpression({ 'Mouth_Smile_L': 0.15, 'Mouth_Smile_R': 0.15 });
   }, 2500);
 }
@@ -201,7 +201,7 @@ export function tutorCelebrates() {
     'Brow_Raise_Outer_R': 0.8,
   });
   setTimeout(() => {
-    store.setPhase(store.phase);
+    store.setPhase(useSessionStore.getState().phase);  // the phase now, not when the gesture started
     store.setExpression({ 'Mouth_Smile_L': 0.2, 'Mouth_Smile_R': 0.2 });
   }, 3000);
 }

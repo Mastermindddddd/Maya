@@ -1,14 +1,17 @@
 /**
  * AvatarRenderer
  * ──────────────
- * Renders teacher_maya_tiny.glb using expo-gl + Three.js directly.
+ * Renders teacher_maya_opt.glb using expo-gl + Three.js directly.
  * No expo-three dependency — pure Three.js with the expo-gl context.
  *
  * GLB is loaded via expo-asset → base64 read → ArrayBuffer parse.
  * The GLTFLoader is imported from three/examples/jsm (bundled with three).
+ * Call preloadAvatar() early (HomeScreen does) so the session screen opens fast.
  *
+ * The GLB is produced by optimize-model.mjs (root motion removed, unused tracks,
+ * meshes and textures dropped, morph targets sparse) — rerun it after changing the model.
  * Shape keys: the ~43 CC4 morph targets kept by strip-morphs.mjs.
- * Animations: all CC clips in the AnimationMixer, cleaned up by removeRootMotion + pruneTracks.
+ * Animations: all CC clips in the AnimationMixer.
  * Lip sync: visemes open the jaw through the Rigify face bones (works without morphs),
  *           plus the CC4 viseme shape keys when morphs are enabled.
  */
@@ -19,7 +22,7 @@ import { GLView, ExpoWebGLRenderingContext } from 'expo-gl';
 import { Asset } from 'expo-asset';
 import * as FileSystem from 'expo-file-system';
 import * as THREE from 'three';
-import { GLTFLoader, GLTFParser } from 'three/examples/jsm/loaders/GLTFLoader';
+import { GLTF, GLTFLoader, GLTFParser } from 'three/examples/jsm/loaders/GLTFLoader';
 import { decode, encode } from 'base64-arraybuffer';
 import { useSessionStore } from '../store/sessionStore';
 
@@ -27,7 +30,7 @@ import { useSessionStore } from '../store/sessionStore';
 const DEBUG_NO_ANIMATION    = false;  // true = never play clips (model stays in rest pose)
 const DEBUG_NO_MORPHS       = true;   // true = ignore morph targets (no blink / lip shapes; the jaw still moves). Flip to false to test morphs
 const DEBUG_PLAIN_SKIN      = false;  // true = plain colours per material instead of the GLB's base-colour textures
-const TARGET_FPS            = 30;     // cap the render/animation rate
+const TARGET_FPS            = 60;     // cap the render/animation rate; drop to 30 if the phone runs hot or the UI gets sluggish
 
 // ── Types ──────────────────────────────────────────────────────────────────
 export type AnimationState =
@@ -73,13 +76,16 @@ interface Props {
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const FADE_DURATION  = 0.35;
+const FADE_DURATION  = 0.5;
+const MAX_DELTA      = 0.1;    // seconds; a long stall (GC, loading) shouldn't make her jump
+// States that loop; everything else is a one-shot gesture
+const LOOPING_STATES = new Set<AnimationState>(['idle', 'listening', 'talking', 'talking2', 'thinking']);
+const LOOPING_CLIPS  = new Set([...LOOPING_STATES].map(state => ANIMATION_MAP[state]));
 const BLINK_INTERVAL = 4000;
 const BLINK_DURATION = 120;
 const MORPH_LERP     = 0.18;   // smoothing for expressions
 const VISEME_LERP    = 0.55;   // visemes change every ~50ms, so they need much faster smoothing
 const VISEME_NAMES   = new Set<string>(SHAPE_KEYS.visemes);
-const CLIP_FPS       = 30;     // resample rate for the root-motion fix
 
 // Jaw: how far each viseme opens the mouth (0–1), and the angle at 1
 const JAW_MAX_ANGLE = THREE.MathUtils.degToRad(14);
@@ -276,98 +282,95 @@ const makeMaterial = (mesh: THREE.SkinnedMesh, orig: THREE.MeshStandardMaterial)
   );
 };
 
-// ── Clip clean-up ──────────────────────────────────────────────────────────
-// Rigify keeps its parent-switch helpers (MCH-torsoparent, MCH-*_ikparent*) beside
-// `root`, not under it, and the CC clips bake a large drifting root motion into
-// `root` AND into those siblings. Dropping only some of those tracks makes parts of
-// the rig disagree, which tears the face, teeth and arms. Instead, cancel the root's
-// motion on every top-level bone: the clip then plays in place with the rig intact.
-const removeRootMotion = (clip: THREE.AnimationClip, model: THREE.Object3D) => {
-  const rootBone = model.getObjectByName('root');
-  if (!rootBone) return;
-  const tops: THREE.Object3D[] = [];
-  model.traverse(o => { if ((o as THREE.Bone).isBone && !(o.parent as THREE.Bone)?.isBone) tops.push(o); });
+// ── Model loading (shared, so it can start before the session screen) ───────
+type AvatarModel = {
+  model:      THREE.Group;
+  animations: THREE.AnimationClip[];
+  meshes:     THREE.SkinnedMesh[];
+  resetPose:  () => void;  // puts every bone back to its rest pose
+};
 
-  const byName = new Map(clip.tracks.map(t => [t.name, t]));
-  const interpolants = new Map<string, THREE.Interpolant>();
-  const sample = <T extends THREE.Vector3 | THREE.Quaternion>(bone: THREE.Object3D, prop: 'position' | 'quaternion' | 'scale', t: number, out: T): T => {
-    const key = `${bone.name}.${prop}`;
-    const track = byName.get(key);
-    if (!track) return out.copy(bone[prop] as any) as T;
-    if (!interpolants.has(key)) interpolants.set(key, track.createInterpolant());
-    return out.fromArray(interpolants.get(key)!.evaluate(t) as any) as T;
-  };
+// While morphs are disabled, don't even decode them: drop the targets from the JSON first
+const skipMorphsPlugin = (parser: GLTFParser) => ({
+  name: 'SkipMorphs',
+  beforeRoot: () => {
+    (parser.json.meshes ?? []).forEach((mesh: any) => {
+      mesh.primitives.forEach((prim: any) => delete prim.targets);
+      delete mesh.weights;
+      if (mesh.extras) delete mesh.extras.targetNames;
+    });
+  },
+});
 
-  const n     = Math.max(2, Math.round(clip.duration * CLIP_FPS) + 1);
-  const times = new Float32Array(n);
-  for (let i = 0; i < n; i++) times[i] = Math.min(clip.duration, i / CLIP_FPS);
+const loadAvatarModel = async (): Promise<AvatarModel> => {
+  // Resolve the bundled asset
+  const asset = Asset.fromModule(require('../../assets/models/teacher_maya_opt.glb'));
+  await asset.downloadAsync();
+  const uri = asset.localUri ?? asset.uri;
 
-  const restRoot = new THREE.Matrix4().compose(rootBone.position, rootBone.quaternion, rootBone.scale);
-  const p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
-  const animRoot = new THREE.Matrix4(), correction = new THREE.Matrix4(), m = new THREE.Matrix4();
-  const out = tops.map(() => ({ p: new Float32Array(n * 3), q: new Float32Array(n * 4), s: new Float32Array(n * 3) }));
+  // Read as base64 → ArrayBuffer (works on both iOS and Android)
+  const b64    = await FileSystem.readAsStringAsync(uri, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+  const binary = decode(b64);
 
-  for (let i = 0; i < n; i++) {
-    const t = times[i];
-    animRoot.compose(sample(rootBone, 'position', t, p), sample(rootBone, 'quaternion', t, q).normalize(), sample(rootBone, 'scale', t, s));
-    correction.copy(restRoot).multiply(animRoot.invert());  // takes the animated root back to rest
-    tops.forEach((bone, k) => {
-      m.compose(sample(bone, 'position', t, p), sample(bone, 'quaternion', t, q).normalize(), sample(bone, 'scale', t, s));
-      m.premultiply(correction).decompose(p, q, s);
-      p.toArray(out[k].p, i * 3); q.toArray(out[k].q, i * 4); s.toArray(out[k].s, i * 3);
+  // RN has a navigator object but no userAgent; GLTFLoader's constructor needs one
+  if (typeof navigator !== 'undefined' && !(navigator as any).userAgent) {
+    Object.defineProperty(navigator, 'userAgent', {
+      value: 'ReactNative',
+      configurable: true,
     });
   }
 
-  const topNames = new Set(tops.map(b => b.name));
-  clip.tracks = clip.tracks.filter(t => !topNames.has(t.name.substring(0, t.name.lastIndexOf('.'))));
-  tops.forEach((bone, k) => {
-    clip.tracks.push(
-      new THREE.VectorKeyframeTrack(`${bone.name}.position`, times, out[k].p),
-      new THREE.QuaternionKeyframeTrack(`${bone.name}.quaternion`, times, out[k].q),
-      new THREE.VectorKeyframeTrack(`${bone.name}.scale`, times, out[k].s),
-    );
-  });
-};
+  const loader = new GLTFLoader();
+  loader.register(expoTexturePlugin as any);
+  if (DEBUG_NO_MORPHS) loader.register(skipMorphsPlugin as any);
+  const gltf = await new Promise<GLTF>((resolve, reject) => loader.parse(binary, '', resolve, reject));
 
-// Lossless pruning (≈2175 → ≈200 tracks per clip): drop tracks of bones that never move
-// the mesh, and tracks that never leave the bone's rest value (the mixer restores rest
-// for those anyway).
-const pruneTracks = (clip: THREE.AnimationClip, model: THREE.Object3D, deformBones: Set<string>) => {
-  clip.tracks = clip.tracks.filter(t => {
-    const dot  = t.name.lastIndexOf('.');
-    const name = t.name.substring(0, dot);
-    const prop = t.name.substring(dot + 1) as 'position' | 'quaternion' | 'scale';
-    const bone = model.getObjectByName(name);
-    if (!bone || !deformBones.has(name)) return false;
-    const rest   = bone[prop].toArray() as number[];
-    const values = t.values;
-    for (let i = 0; i < values.length; i++) {
-      if (Math.abs(values[i] - rest[i % rest.length]) > 1e-4) return true;
-    }
-    return false;
-  });
-};
+  const model = gltf.scene;
+  model.frustumCulled = false;
 
-// Bones that actually move the mesh (skin weight > 0), plus all their ancestors
-const findDeformBones = (meshes: THREE.SkinnedMesh[]) => {
-  const keep = new Set<string>();
+  const meshes: THREE.SkinnedMesh[] = [];
+  model.traverse(child => {
+    if (!(child instanceof THREE.SkinnedMesh)) return;
+    meshes.push(child);
+    child.frustumCulled = false;
+    child.castShadow    = false;
+    const orig     = (Array.isArray(child.material) ? child.material[0] : child.material) as THREE.MeshStandardMaterial;
+    const material = makeMaterial(child, orig);
+    if (material) child.material = material;
+    else          child.visible  = false;
+  });
+
+  // GLTFLoader gives every mesh its own copy of the 725-bone skeleton; they all use the
+  // same skin, so share one and the bone matrices are computed/uploaded once per frame.
+  const shared = meshes[0]?.skeleton;
   meshes.forEach(mesh => {
-    const si = mesh.geometry.getAttribute('skinIndex');
-    const sw = mesh.geometry.getAttribute('skinWeight');
-    if (!si || !sw) return;
-    const bones = mesh.skeleton.bones;
-    for (let i = 0; i < si.count; i++) {
-      for (let k = 0; k < 4; k++) {
-        if (sw.getComponent(i, k) <= 0) continue;
-        let b: THREE.Object3D | null = bones[si.getComponent(i, k)] ?? null;
-        while (b && (b as THREE.Bone).isBone && !keep.has(b.name)) {
-          keep.add(b.name);
-          b = b.parent;
-        }
-      }
-    }
+    const sk = mesh.skeleton;
+    if (sk === shared || sk.bones.length !== shared.bones.length) return;
+    const same = sk.bones.every((b, i) => b === shared.bones[i] && sk.boneInverses[i].equals(shared.boneInverses[i]));
+    if (same) mesh.skeleton = shared;
   });
-  return keep;
+
+  const rest: [THREE.Object3D, THREE.Vector3, THREE.Quaternion, THREE.Vector3][] = [];
+  model.traverse(o => {
+    if ((o as THREE.Bone).isBone) rest.push([o, o.position.clone(), o.quaternion.clone(), o.scale.clone()]);
+  });
+  const resetPose = () => rest.forEach(([o, p, q, s]) => {
+    o.position.copy(p); o.quaternion.copy(q); o.scale.copy(s);
+  });
+
+  return { model, animations: gltf.animations, meshes, resetPose };
+};
+
+// Starts loading/parsing the model once; later calls share the same promise.
+let avatarPromise: Promise<AvatarModel> | null = null;
+export const preloadAvatar = () => {
+  if (!avatarPromise) {
+    avatarPromise = loadAvatarModel();
+    avatarPromise.catch(() => { avatarPromise = null; });  // let the next call retry
+  }
+  return avatarPromise;
 };
 
 // ── Jaw rig ────────────────────────────────────────────────────────────────
@@ -432,7 +435,9 @@ export default function AvatarRenderer({
   const targetMorphs     = useRef<Map<string, number>>(new Map());
   const currentMorphs    = useRef<Map<string, number>>(new Map());
   const jawRef           = useRef<JawRig | null>(null);
+  const avatarRef        = useRef<AvatarModel | null>(null);
   const animStateRef     = useRef<AnimationState>(animationState);
+  const baseStateRef     = useRef<AnimationState>('idle');
   const blinkTimer       = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Morph helpers ────────────────────────────────────────────────────────
@@ -478,9 +483,7 @@ export default function AvatarRenderer({
   }, [setMorph]);
 
   // ── Animation switch ──────────────────────────────────────────────────────
-  const switchAnimation = useCallback((state: AnimationState) => {
-    if (DEBUG_NO_ANIMATION) return;
-    const clipName  = ANIMATION_MAP[state];
+  const playClip = useCallback((clipName: string) => {
     const newAction = actionsRef.current.get(clipName);
     if (!newAction) {
       console.warn(`[Avatar] clip not found: ${clipName}`);
@@ -493,109 +496,57 @@ export default function AvatarRenderer({
     currentActionRef.current = newAction;
   }, []);
 
+  // Looping states become the "base"; gestures play once on top and then return to it
+  const switchAnimation = useCallback((state: AnimationState) => {
+    if (DEBUG_NO_ANIMATION) return;
+    if (LOOPING_STATES.has(state)) baseStateRef.current = state;
+    playClip(ANIMATION_MAP[state]);
+  }, [playClip]);
+
   // ── Load GLB ──────────────────────────────────────────────────────────────
   const loadModel = useCallback(async (
     scene: THREE.Scene,
     mixer: THREE.AnimationMixer,
   ) => {
-    // Resolve the bundled asset
-    const asset = Asset.fromModule(require('../../assets/models/teacher_maya_tiny.glb'));
-    await asset.downloadAsync();
-    const uri = asset.localUri ?? asset.uri;
+    const avatar = await preloadAvatar();  // usually already done while the user typed their name
+    avatarRef.current = avatar;
+    avatar.resetPose();  // in case a previous session left it mid-animation
+    scene.add(avatar.model);
+    meshRefs.current = avatar.meshes;
 
-    // Read as base64 → ArrayBuffer (works on both iOS and Android)
-    const b64    = await FileSystem.readAsStringAsync(uri, {
-      encoding: FileSystem.EncodingType.Base64,
+    // Build each mesh's own name → morph index map from its morphTargetDictionary
+    avatar.meshes.forEach(mesh => {
+      const dict = mesh.morphTargetDictionary;
+      if (dict) morphIndices.current.set(mesh, new Map(Object.entries(dict)));
     });
-    const binary = decode(b64);
 
-    // RN has a navigator object but no userAgent; GLTFLoader's constructor needs one
-    if (typeof navigator !== 'undefined' && !(navigator as any).userAgent) {
-      Object.defineProperty(navigator, 'userAgent', {
-        value: 'ReactNative',
-        configurable: true,
-      });
+    // Register all animation clips (already cleaned up by optimize-model.mjs)
+    avatar.animations.forEach(clip => {
+      const action = mixer.clipAction(clip);
+      if (LOOPING_CLIPS.has(clip.name)) {
+        action.setLoop(THREE.LoopRepeat, Infinity);
+      } else {
+        action.setLoop(THREE.LoopOnce, 1);
+        action.clampWhenFinished = true;  // hold the last pose while fading back
+      }
+      actionsRef.current.set(clip.name, action);
+    });
+    mixer.addEventListener('finished', e => {
+      if (e.action === currentActionRef.current) playClip(ANIMATION_MAP[baseStateRef.current]);
+    });
+
+    jawRef.current = makeJawRig(avatar.model);
+
+    console.log('[Avatar] Clips:', [...actionsRef.current.keys()]);
+    console.log('[Avatar] Meshes with shape keys:', morphIndices.current.size);
+
+    // Start idle
+    const idle = actionsRef.current.get(ANIMATION_MAP['idle']);
+    if (idle && !DEBUG_NO_ANIMATION) {
+      idle.play();
+      currentActionRef.current = idle;
     }
-
-    const loader = new GLTFLoader();
-    loader.register(expoTexturePlugin as any);
-
-    await new Promise<void>((resolve, reject) => {
-      loader.parse(binary, '', gltf => {
-        const model = gltf.scene;
-
-        // The GLB is already in metres (bbox 0 → 1.7 on Y)
-        model.scale.setScalar(1);
-        model.position.set(0, 0, 0);
-        model.frustumCulled = false;
-        scene.add(model);
-
-        // Collect skinned meshes + morph dictionaries
-        model.traverse(child => {
-          if (!(child instanceof THREE.SkinnedMesh)) return;
-          meshRefs.current.push(child);
-          child.frustumCulled = false;
-          child.castShadow    = false;
-
-          const orig     = (Array.isArray(child.material) ? child.material[0] : child.material) as THREE.MeshStandardMaterial;
-          const material = makeMaterial(child, orig);
-          if (material) child.material = material;
-          else          child.visible  = false;
-
-          if (DEBUG_NO_MORPHS) {
-            child.geometry.morphAttributes = {};
-            child.morphTargetInfluences = undefined;
-            child.morphTargetDictionary = undefined;
-            return;
-          }
-
-          // Build this mesh's own name → index map from its morphTargetDictionary
-          const dict = child.morphTargetDictionary;
-          if (dict) {
-            const perMesh = new Map<string, number>();
-            Object.entries(dict).forEach(([name, idx]) => {
-              perMesh.set(name, idx as number);
-            });
-            morphIndices.current.set(child, perMesh);
-          }
-        });
-
-        // GLTFLoader gives every mesh its own copy of the 725-bone skeleton; they all use the
-        // same skin, so share one and the bone matrices are computed/uploaded once per frame.
-        const shared = meshRefs.current[0]?.skeleton;
-        meshRefs.current.forEach(mesh => {
-          const sk = mesh.skeleton;
-          if (sk === shared || sk.bones.length !== shared.bones.length) return;
-          const same = sk.bones.every((b, i) => b === shared.bones[i] && sk.boneInverses[i].equals(shared.boneInverses[i]));
-          if (same) mesh.skeleton = shared;
-        });
-
-        // Register all animation clips, cleaned up so they play in place and cheaply
-        const deformBones = findDeformBones(meshRefs.current);
-        gltf.animations.forEach(clip => {
-          removeRootMotion(clip, model);
-          pruneTracks(clip, model, deformBones);
-          const action = mixer.clipAction(clip);
-          action.setLoop(THREE.LoopRepeat, Infinity);
-          actionsRef.current.set(clip.name, action);
-        });
-
-        jawRef.current = makeJawRig(model);
-
-        console.log('[Avatar] Clips:', [...actionsRef.current.keys()]);
-        console.log('[Avatar] Meshes with shape keys:', morphIndices.current.size);
-
-        // Start idle
-        const idle = actionsRef.current.get(ANIMATION_MAP['idle']);
-        if (idle && !DEBUG_NO_ANIMATION) {
-          idle.play();
-          currentActionRef.current = idle;
-        }
-
-        resolve();
-      }, reject);
-    });
-  }, []);
+  }, [playClip]);
 
   // ── GL context ready ──────────────────────────────────────────────────────
   const onContextCreate = useCallback(async (gl: ExpoWebGLRenderingContext) => {
@@ -669,14 +620,16 @@ export default function AvatarRenderer({
       mixerRef.current = mixer;
 
       // ── Render loop (capped), started BEFORE loading so a frame is always drawn ──
+      // The cap allows a few ms of vsync jitter: a strict `< frameMs` check skips frames that
+      // arrive a hair early, giving an uneven 33/50 ms rhythm that reads as stutter.
       let lastFrame = 0;
       const frameMs = 1000 / TARGET_FPS;
       const tick = () => {
         rafRef.current = requestAnimationFrame(tick);
-        const now = Date.now();
-        if (now - lastFrame < frameMs) return;
+        const now = performance.now();
+        if (now - lastFrame < frameMs - 4) return;
         lastFrame = now;
-        const delta = clockRef.current.getDelta();
+        const delta = Math.min(clockRef.current.getDelta(), MAX_DELTA);
         jawRef.current?.restore();
         mixer.update(delta);
         const jaw = applyMorphs();
@@ -738,6 +691,13 @@ export default function AvatarRenderer({
       if (blinkTimer.current) clearTimeout(blinkTimer.current);
       rendererRef.current?.dispose();
       mixerRef.current?.stopAllAction();
+      // The parsed model is cached for the next session: detach it and leave it at rest
+      const avatar = avatarRef.current;
+      if (avatar) {
+        mixerRef.current?.uncacheRoot(mixerRef.current.getRoot());
+        avatar.model.removeFromParent();
+        avatar.resetPose();
+      }
     };
   }, []);
 
