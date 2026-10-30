@@ -21,7 +21,7 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.yourname.aiteacher",
       "infoPlist": {
-        "NSCameraUsageDescription": "Maya uses your camera to see what you're working on and help you in real time.",
+        "NSCameraUsageDescription": "Maya uses your camera to see what you're working on and help you in real time, and, if you turn it on, to notice your expressions. Your face is read on this phone only.",
         "NSMicrophoneUsageDescription": "Maya listens to your questions so she can answer them.",
         "NSPhotoLibraryUsageDescription": "Maya can look at photos of your notes to help you."
       }
@@ -45,7 +45,7 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "Maya uses your camera to see what you're working on."
+          "cameraPermission": "Maya uses your camera to see what you're working on and, if you turn it on, to notice your expressions. Your face is read on this phone only."
         }
       ],
       "expo-av"

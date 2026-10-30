@@ -25,6 +25,7 @@ import * as THREE from 'three';
 import { GLTF, GLTFLoader, GLTFParser } from 'three/examples/jsm/loaders/GLTFLoader';
 import { decode, encode } from 'base64-arraybuffer';
 import { useSessionStore } from '../store/sessionStore';
+import { REACTIONS, TutorReaction } from '../engine/emotion';
 
 // ── Debug / tuning switches ────────────────────────────────────────────────
 const DEBUG_NO_ANIMATION    = false;  // true = never play clips (model stays in rest pose)
@@ -71,6 +72,7 @@ export type ExpressionWeights = Partial<Record<string, number>>;
 interface Props {
   animationState?: AnimationState;
   expression?:     ExpressionWeights;
+  reaction?:       TutorReaction;  // reaction to the student's emotion: extra expression + posture
   onReady?:        () => void;
   onError?:        (err: Error) => void;
   onGestureFinished?: () => void;  // a one-shot gesture (nod, wave…) ended and she went back to her loop
@@ -85,7 +87,7 @@ const LOOPING_CLIPS  = new Set([...LOOPING_STATES].map(state => ANIMATION_MAP[st
 const BLINK_INTERVAL = 4000;
 const BLINK_DURATION = 120;
 // Smoothing time constants (seconds), so they're the same at any frame rate
-const MORPH_TAU      = 0.12;   // expressions
+const MORPH_TAU      = 0.25;   // expressions: gentle enough to read as a reaction, not a twitch
 const VISEME_TAU     = 0.05;   // mouth shapes change every ~60ms while speaking
 const BLINK_TAU      = 0.03;   // a blink lasts 120ms, so it has to close fast
 const VISEME_NAMES   = new Set<string>(SHAPE_KEYS.visemes);
@@ -427,13 +429,19 @@ const makeJawRig = (model: THREE.Object3D): JawRig | null => {
 const HEAD_SWAY   = THREE.MathUtils.degToRad(2.2);  // idle amplitude; 1.6× while talking
 const EYE_RANGE   = THREE.MathUtils.degToRad(6);
 const SACCADE_TAU = 0.035;  // eye glances are quick
+const POSTURE_TAU = 0.7;    // leaning in / tilting the head is a slow, deliberate move
 
-type LifeRig = { restore: () => void; apply: (time: number, dt: number, talking: boolean) => void };
+// Lean and tilt (radians) from the current reaction
+export type Posture = { lean: number; tilt: number };
+type LifeRig = { restore: () => void; apply: (time: number, dt: number, talking: boolean, posture: Posture) => void };
 
 const makeLifeRig = (model: THREE.Object3D): LifeRig | null => {
-  const bones = ['DEF-spine006', 'ORG-spine006', 'MCH-eyeL', 'MCH-eyeR'].map(n => model.getObjectByName(n));
+  // Upper body: DEF-spine002 carries the torso skin, MCH-spine002 the arms, neck and face
+  const bones = ['DEF-spine006', 'ORG-spine006', 'MCH-eyeL', 'MCH-eyeR', 'DEF-spine002', 'MCH-spine002']
+    .map(n => model.getObjectByName(n));
   if (bones.some(b => !b?.parent)) return null;
-  const [headSkin, headFace, eyeL, eyeR] = bones as THREE.Object3D[];
+  const [headSkin, headFace, eyeL, eyeR, torsoSkin, torsoRig] = bones as THREE.Object3D[];
+  const posture: Posture = { lean: 0, tilt: 0 };
   const saved = bones.map(() => ({ p: new THREE.Vector3(), q: new THREE.Quaternion(), s: new THREE.Vector3() }));
   let applied = false;
 
@@ -463,14 +471,25 @@ const makeLifeRig = (model: THREE.Object3D): LifeRig | null => {
       bones.forEach((b, i) => { b!.position.copy(saved[i].p); b!.quaternion.copy(saved[i].q); b!.scale.copy(saved[i].s); });
       applied = false;
     },
-    apply: (t, dt, talking) => {
+    apply: (t, dt, talking, target) => {
       bones.forEach((b, i) => { saved[i].p.copy(b!.position); saved[i].q.copy(b!.quaternion); saved[i].s.copy(b!.scale); });
       applied = true;
+
+      // Lean the upper body forward from the waist (both chains, same pivot)
+      const k = 1 - Math.exp(-dt / POSTURE_TAU);
+      posture.lean += (target.lean - posture.lean) * k;
+      posture.tilt += (target.tilt - posture.tilt) * k;
+      if (Math.abs(posture.lean) > 1e-4) {
+        q.setFromEuler(euler.set(posture.lean, 0, 0));
+        torsoSkin.getWorldPosition(pivot);
+        rotateInWorld(torsoSkin, pivot, q);
+        rotateInWorld(torsoRig, pivot, q);
+      }
 
       const amp   = HEAD_SWAY * (talking ? 1.6 : 1);
       const yaw   = amp * wave(t, 0.37, 0.83, 1.71);
       const pitch = amp * 0.7 * wave(t + 11, 0.43, 0.97, 1.93);
-      const roll  = amp * 0.45 * wave(t + 23, 0.29, 0.71, 1.37);
+      const roll  = amp * 0.45 * wave(t + 23, 0.29, 0.71, 1.37) + posture.tilt;
       q.setFromEuler(euler.set(pitch, yaw, roll, 'YXZ'));
       headSkin.getWorldPosition(pivot);
       rotateInWorld(headSkin, pivot, q);
@@ -484,8 +503,8 @@ const makeLifeRig = (model: THREE.Object3D): LifeRig | null => {
         nextGlance = t + 0.8 + Math.random() * 2.2;
       }
       gaze.lerp(gazeTarget, 1 - Math.exp(-dt / SACCADE_TAU));
-      // The eyes cancel most of the head turn, so her gaze stays steady
-      q.setFromEuler(euler.set(gaze.y - pitch * 0.7, gaze.x - yaw * 0.7, 0, 'YXZ'));
+      // The eyes cancel most of the head turn and the lean, so her gaze stays on the student
+      q.setFromEuler(euler.set(gaze.y - (pitch + posture.lean) * 0.7, gaze.x - yaw * 0.7, 0, 'YXZ'));
       for (const eye of [eyeL, eyeR]) {
         eye.getWorldPosition(pivot);
         rotateInWorld(eye, pivot, q);
@@ -498,6 +517,7 @@ const makeLifeRig = (model: THREE.Object3D): LifeRig | null => {
 export default function AvatarRenderer({
   animationState = 'idle',
   expression     = {},
+  reaction       = 'neutral',
   onReady,
   onError,
   onGestureFinished,
@@ -519,6 +539,8 @@ export default function AvatarRenderer({
   const jawRef           = useRef<JawRig | null>(null);
   const lifeRef          = useRef<LifeRig | null>(null);
   const avatarRef        = useRef<AvatarModel | null>(null);
+  const postureRef       = useRef<Posture>({ lean: 0, tilt: 0 });
+  const reactionKeys     = useRef<string[]>([]);
   const gestureDoneRef   = useRef(onGestureFinished);
   gestureDoneRef.current = onGestureFinished;
   const animStateRef     = useRef<AnimationState>(animationState);
@@ -730,7 +752,7 @@ export default function AvatarRenderer({
         mixer.update(delta);
         const jaw     = applyMorphs(delta);
         const talking = !!TALK_ALTERNATE[ANIMATION_MAP[baseStateRef.current]];
-        lifeRef.current?.apply(now / 1000, delta, talking);
+        lifeRef.current?.apply(now / 1000, delta, talking, postureRef.current);
         jawRef.current?.open(jaw * JAW_MAX_ANGLE);
         renderer.render(scene, camera);
         gl.endFrameEXP();
@@ -775,12 +797,19 @@ export default function AvatarRenderer({
     });
   }, [setMorph]);
 
-  // ── Sync expression weights ───────────────────────────────────────────────
+  // ── Sync expression weights + reaction ────────────────────────────────────
+  // The reaction's blend shapes are added on top of the phase expression; shapes the
+  // previous reaction used go back to the phase value.
   useEffect(() => {
-    Object.entries(expression).forEach(([k, v]) => {
-      if (v !== undefined) setMorph(k, v);
-    });
-  }, [expression, setMorph]);
+    const extra = REACTIONS[reaction].expression;
+    const keys  = new Set([...Object.keys(expression), ...Object.keys(extra), ...reactionKeys.current]);
+    keys.forEach(k => setMorph(k, (expression[k] ?? 0) + (extra[k] ?? 0)));
+    reactionKeys.current = Object.keys(extra);
+    postureRef.current = {
+      lean: THREE.MathUtils.degToRad(REACTIONS[reaction].lean),
+      tilt: THREE.MathUtils.degToRad(REACTIONS[reaction].tilt),
+    };
+  }, [expression, reaction, setMorph]);
 
   // ── Cleanup ───────────────────────────────────────────────────────────────
   useEffect(() => {

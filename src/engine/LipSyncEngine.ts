@@ -27,6 +27,7 @@
 
 import { useEffect, useRef, useCallback } from 'react';
 import type { VisemeWeights } from '../components/AvatarRenderer';
+import type { SpeechStyle } from './emotion';
 import { useSessionStore } from '../store/sessionStore';
 
 type SetVisemeFn = (weights: VisemeWeights) => void;
@@ -155,16 +156,17 @@ export class LipSyncEngine {
 
   // ── Mode 1: animate visemes from plain text ──────────────────────────
   // Returns how long the speech lasts (ms). Pass durationMs to fit it to a known audio length.
-  speakText(text: string, durationMs?: number): number {
+  // style.rate < 1 speaks slower; style.intensity < 1 moves the mouth less (a softer tone).
+  speakText(text: string, durationMs?: number, style: SpeechStyle = { rate: 1, intensity: 1 }): number {
     this.stop();
     const units = textUnits(text);
     if (units.length === 0) return 0;
     const natural = units.reduce((sum, u) => sum + u.ms, 0);
-    const scale   = durationMs ? durationMs / natural : 1;
+    const scale   = durationMs ? durationMs / natural : 1 / style.rate;
     const frames: Frame[] = [];
     let t = 0;
     for (const u of units) {
-      frames.push({ time: t, weights: this.singleViseme(u.key, u.weight) });
+      frames.push({ time: t, weights: this.singleViseme(u.key, Math.min(1, u.weight * style.intensity)) });
       t += u.ms * scale;
     }
     frames.push({ time: t, weights: {} });
@@ -279,8 +281,8 @@ export function useLipSync() {
   // Stop the loop if the screen using this hook unmounts
   useEffect(() => () => engine.current?.stop(), []);
 
-  const speak = useCallback((text: string, durationMs?: number) => {
-    return engine.current?.speakText(text, durationMs) ?? 0;
+  const speak = useCallback((text: string, durationMs?: number, style?: SpeechStyle) => {
+    return engine.current?.speakText(text, durationMs, style) ?? 0;
   }, []);
 
   const speakCharacters = useCallback(

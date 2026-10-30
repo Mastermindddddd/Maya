@@ -38,3 +38,9 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# Emotion training data (from real students — keep out of git)
+training/data/
+training/exports/
+training/.venv/
+training/__pycache__/

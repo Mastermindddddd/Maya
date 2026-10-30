@@ -12,6 +12,7 @@
 
 import { create } from 'zustand';
 import { AnimationState, VisemeWeights, ExpressionWeights } from '../components/AvatarRenderer';
+import type { StudentEmotion, TutorReaction } from '../engine/emotion';
 
 // ── Conversation ──────────────────────────────────────────────────────────
 export type Speaker = 'student' | 'tutor';
@@ -53,6 +54,15 @@ interface SessionState {
   expression:     ExpressionWeights;
   setExpression:  (expr: ExpressionWeights) => void;
   clearExpression: () => void;
+
+  // Student emotion → tutor reaction (see engine/emotion.ts)
+  studentEmotion: StudentEmotion;
+  tutorReaction:  TutorReaction;
+  setReaction:    (reaction: TutorReaction, emotion: StudentEmotion) => void;
+
+  // The tutoring logic reports each checked answer here; it feeds emotion detection
+  lastAnswer:     { correct: boolean; at: number } | null;
+  reportAnswer:   (correct: boolean) => void;
 
   // Conversation
   messages:       Message[];
@@ -106,6 +116,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     expression: { ...s.expression, ...expression }
   })),
   clearExpression: () => set({ expression: {} }),
+
+  // Emotion reaction
+  studentEmotion: 'neutral',
+  tutorReaction:  'neutral',
+  setReaction:    (tutorReaction, studentEmotion) => set({ tutorReaction, studentEmotion }),
+  lastAnswer:     null,
+  reportAnswer:   (correct) => set({ lastAnswer: { correct, at: Date.now() } }),
 
   // Conversation
   messages: [],

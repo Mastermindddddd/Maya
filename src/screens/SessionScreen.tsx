@@ -12,9 +12,9 @@
  * top 65% of screen, controls occupy the bottom 35%.
  */
 
-import React, { useCallback, useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, Animated,
+  View, Text, TouchableOpacity, StyleSheet, Animated, Alert,
   ScrollView, Easing, Platform, Dimensions,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -25,6 +25,15 @@ import { RootStackParamList } from '../../App';
 import AvatarRenderer, { AnimationState } from '../components/AvatarRenderer';
 import LoadingOverlay from '../components/LoadingOverlay';
 import { useLipSync } from '../engine/LipSyncEngine';
+import { ManualEmotionDetector, REACTIONS, StudentEmotion } from '../engine/emotion';
+import { useEmotionReactions } from '../engine/useEmotionReactions';
+import { ContextEvidence } from '../engine/contextSignals';
+import { FACE_TRUST, FusedEmotionDetector, FusionInfo, TRUST_ALL } from '../engine/emotionFusion';
+import { useContextSignals } from '../engine/useContextSignals';
+import EmotionCamera, { CameraEmotionDetector, CameraInfo } from '../components/EmotionCamera';
+import CheckInCard from '../components/CheckInCard';
+import { useCheckIns } from '../engine/useCheckIns';
+import { deleteCheckIns, exportCheckIns } from '../engine/checkins';
 import {
   useSessionStore,
   studentStartsSpeaking,
@@ -41,6 +50,15 @@ type Props = {
 };
 
 const { height: SCREEN_H } = Dimensions.get('window');
+
+// Prototype student lines for the mic button (until speech-to-text is wired up); they
+// exercise the context signals: a request, a confused line, the same question again, a win
+const MOCK_STUDENT_LINES = [
+  'Can you help me with quadratic equations?',
+  "Wait, what do you mean? I don't get it.",
+  'Can you help me with quadratic equations again?',
+  'Oh I see, that makes sense now!',
+];
 const AVATAR_HEIGHT = SCREEN_H * 0.65;
 
 // ── Design tokens ─────────────────────────────────────────────────────────
@@ -77,6 +95,8 @@ export default function SessionScreen({ navigation, route }: Props) {
   const phase          = useSessionStore(s => s.phase);
   const animationState = useSessionStore(s => s.animationState);
   const expression     = useSessionStore(s => s.expression);
+  const tutorReaction  = useSessionStore(s => s.tutorReaction);
+  const studentEmotion = useSessionStore(s => s.studentEmotion);
   const messages       = useSessionStore(s => s.messages);
   const isAvatarReady  = useSessionStore(s => s.isAvatarReady);
   const transcriptVisible = useSessionStore(s => s.transcriptVisible);
@@ -98,10 +118,87 @@ export default function SessionScreen({ navigation, route }: Props) {
   const tutorSays = useCallback((text: string) => {
     addMessage({ speaker: 'tutor', text });
     tutorStartsSpeaking();
-    const durationMs = speak(text);
+    // Speak in the style of the current reaction (e.g. slower and softer when the student is frustrated)
+    const durationMs = speak(text, undefined, REACTIONS[useSessionStore.getState().tutorReaction].speech);
     if (speechTimer.current) clearTimeout(speechTimer.current);
     speechTimer.current = setTimeout(tutorFinishedSpeaking, durationMs + 150);
   }, [addMessage, speak]);
+
+  // ── Student emotion → Maya's reaction ─────────────────────────────────
+  // With the camera on, MediaPipe reads the student's face on the phone (EmotionCamera).
+  // With it off, the "Student" test chips set what the manual detector reports.
+  const emotionDetector = useMemo(() => new ManualEmotionDetector(), []);
+  const cameraDetector  = useMemo(() => new CameraEmotionDetector(), []);
+  const [cameraOn, setCameraOn]     = useState(false);
+  const [cameraInfo, setCameraInfo] = useState<CameraInfo>({ status: 'off' });
+  useEffect(() => {
+    cameraDetector.onInfo = setCameraInfo;
+    return () => { cameraDetector.onInfo = undefined; };
+  }, [cameraDetector]);
+  // Face readings are fused with context signals (answers, what the student says, silence).
+  // The camera's face readings are only trusted where they've proven reliable (FACE_TRUST);
+  // the test chips are trusted fully, since they stand in for a perfect detector.
+  const context = useMemo(() => new ContextEvidence(), []);
+  useContextSignals(context);
+  const [fusionInfo, setFusionInfo] = useState<FusionInfo>({ emotion: null, score: 0, reason: '' });
+  const fusedDetector = useMemo(() => {
+    const d = cameraOn
+      ? new FusedEmotionDetector(cameraDetector, context, FACE_TRUST)
+      : new FusedEmotionDetector(emotionDetector, context, TRUST_ALL);
+    d.onInfo = info => setFusionInfo(prev =>
+      prev.emotion === info.emotion && prev.reason === info.reason && Math.abs(prev.score - info.score) < 0.05 ? prev : info);
+    return d;
+  }, [cameraOn, cameraDetector, emotionDetector, context]);
+  useEmotionReactions(fusedDetector, isAvatarReady);
+  const mockLine = useRef(0);
+
+  // "How's this going?" check-ins: labelled data for training the classifier (training/)
+  const checkIns = useCheckIns(cameraDetector, cameraOn && cameraInfo.status === 'on');
+  const manageCheckIns = () => {
+    if (checkIns.count === 0) {
+      Alert.alert('No check-ins yet', "With the camera on, Maya sometimes asks how it's going. Answers you agree to save appear here.");
+      return;
+    }
+    Alert.alert(`${checkIns.count} check-ins saved`, 'They stay on this phone until you export them.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete all', style: 'destructive', onPress: () => Alert.alert('Delete all check-ins?', 'This cannot be undone.', [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: () => deleteCheckIns().then(checkIns.refreshCount) },
+      ]) },
+      { text: 'Export', onPress: () => exportCheckIns().then(ok => {
+        if (!ok) Alert.alert('Export unavailable', 'Sharing files is not available on this device.');
+      }) },
+    ]);
+  };
+
+  // Ask before switching the camera on, and say exactly what happens to the video
+  const toggleCamera = () => {
+    if (cameraOn) { setCameraOn(false); return; }
+    Alert.alert(
+      'Let Maya see your expressions?',
+      "Maya can use your front camera to notice when you're frustrated, confused or excited, " +
+      'and adjust how she explains. Your face is read on this phone only: no video or photos ' +
+      'are saved or sent anywhere. You can turn it off at any time.',
+      [
+        { text: 'Not now', style: 'cancel' },
+        { text: 'Turn on', onPress: () => setCameraOn(true) },
+      ],
+    );
+  };
+  const cameraLabel = (() => {
+    switch (cameraInfo.status) {
+      case 'camera': return 'Starting camera…';
+      case 'model':  return 'Loading face reader…';
+      case 'error':  return `Camera unavailable: ${cameraInfo.error ?? 'unknown error'}`;
+      case 'on':
+        if (!cameraInfo.face) return 'Camera on · no face in view';
+        if (cameraInfo.reading?.emotion && cameraInfo.reading.emotion !== 'neutral') {
+          return `Camera on · looks ${cameraInfo.reading.emotion} (${Math.round(cameraInfo.reading.confidence * 100)}%)`;
+        }
+        return 'Camera on · looks neutral';
+      default: return 'Camera on';
+    }
+  })();
   useEffect(() => () => {
     if (speechTimer.current) clearTimeout(speechTimer.current);
     stopSpeaking();
@@ -144,7 +241,7 @@ export default function SessionScreen({ navigation, route }: Props) {
     if (!isAvatarReady) return;
     if (phase === 'listening') {
       // Stop listening — simulate student finishing
-      const mockStudentText = "Can you help me with quadratic equations?";
+      const mockStudentText = MOCK_STUDENT_LINES[mockLine.current++ % MOCK_STUDENT_LINES.length];
       addMessage({ speaker: 'student', text: mockStudentText });
       tutorIsThinking();
       // Simulate LLM + TTS for prototype
@@ -166,6 +263,7 @@ export default function SessionScreen({ navigation, route }: Props) {
         <AvatarRenderer
           animationState={animationState}
           expression={expression}
+          reaction={tutorReaction}
           onReady={handleAvatarReady}
           onError={(err) => { console.error(err); setPhase('error'); }}
           // Back to the phase's animation, so the gesture chip un-highlights and can be tapped again
@@ -184,16 +282,39 @@ export default function SessionScreen({ navigation, route }: Props) {
             <View style={[s.statusDot, { backgroundColor: phaseInfo.color }]} />
             <Text style={s.nameText}>Maya</Text>
           </View>
-          <TouchableOpacity style={s.transcriptBtn} onPress={toggleTranscript}>
-            <Text style={s.transcriptBtnText}>≡</Text>
-          </TouchableOpacity>
+          <View style={s.topRight}>
+            <TouchableOpacity
+              style={[s.transcriptBtn, cameraOn && s.cameraBtnOn]}
+              onPress={toggleCamera}
+              accessibilityLabel={cameraOn ? 'Turn off expression camera' : 'Let Maya see your expressions'}
+            >
+              <Text style={s.transcriptBtnText}>{cameraOn ? '📷' : '🙂'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.transcriptBtn} onPress={toggleTranscript}>
+              <Text style={s.transcriptBtnText}>≡</Text>
+            </TouchableOpacity>
+          </View>
         </View>
+
+        {/* Camera indicator: always visible while the camera is on */}
+        {cameraOn && (
+          <View style={s.cameraPill}>
+            <View style={[s.statusDot, { backgroundColor: cameraInfo.status === 'on' ? C.red : C.textDim }]} />
+            <Text style={s.cameraPillText} numberOfLines={1}>{cameraLabel}</Text>
+          </View>
+        )}
+        {cameraOn && <EmotionCamera detector={cameraDetector} />}
+        {checkIns.showing && <CheckInCard onAnswer={checkIns.answer} onSkip={checkIns.skip} />}
 
         {/* Status label */}
         <View style={s.statusBar}>
           <Text style={[s.statusText, { color: phaseInfo.color }]}>
             {phaseInfo.label}
           </Text>
+          {/* Why Maya is reacting, for testing and tuning */}
+          {fusionInfo.emotion && fusionInfo.score >= 0.45 && !!fusionInfo.reason && (
+            <Text style={s.noticingText} numberOfLines={1}>Noticing: {fusionInfo.reason}</Text>
+          )}
         </View>
       </View>
 
@@ -222,6 +343,34 @@ export default function SessionScreen({ navigation, route }: Props) {
           </ScrollView>
         )}
 
+        {/* Student row — for testing the reactions. Face chips stand in for the camera
+            (hidden while it's on); answer chips stand in for the tutoring logic. */}
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={s.animRow} contentContainerStyle={s.animRowContent}>
+          <Text style={[s.animChipText, s.emotionLabel]}>Student:</Text>
+          <TouchableOpacity style={s.animChip} onPress={() => useSessionStore.getState().reportAnswer(true)}>
+            <Text style={s.animChipText}>✓ Right answer</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.animChip} onPress={() => useSessionStore.getState().reportAnswer(false)}>
+            <Text style={s.animChipText}>✗ Wrong answer</Text>
+          </TouchableOpacity>
+          {!cameraOn && ([
+            ['😐 Neutral',    'neutral'   ],
+            ['😣 Frustrated', 'frustrated'],
+            ['🤔 Confused',   'confused'  ],
+            ['🤩 Excited',    'excited'   ],
+          ] as [string, StudentEmotion][]).map(([label, emotion]) => (
+            <TouchableOpacity
+              key={emotion}
+              style={[s.animChip, studentEmotion === emotion && s.animChipActive]}
+              onPress={() => emotionDetector.set(emotion)}
+            >
+              <Text style={[s.animChipText, studentEmotion === emotion && s.animChipTextActive]}>
+                {label}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+
         {/* Animation quick-switch row — for testing */}
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={s.animRow} contentContainerStyle={s.animRowContent}>
           {([
@@ -247,6 +396,9 @@ export default function SessionScreen({ navigation, route }: Props) {
               </Text>
             </TouchableOpacity>
           ))}
+          <TouchableOpacity style={s.animChip} onPress={manageCheckIns}>
+            <Text style={s.animChipText}>⇪ Check-ins ({checkIns.count})</Text>
+          </TouchableOpacity>
         </ScrollView>
 
         {/* Main controls row */}
@@ -303,10 +455,15 @@ const s = StyleSheet.create({
   nameText:        { fontSize: 14, fontWeight: '600', color: C.text },
   transcriptBtn:   { width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(11,15,26,0.7)', alignItems: 'center', justifyContent: 'center' },
   transcriptBtnText: { fontSize: 20, color: C.text },
+  topRight:        { flexDirection: 'row', gap: 8 },
+  cameraBtnOn:     { borderWidth: 1, borderColor: C.red },
+  cameraPill:      { position: 'absolute', top: 66, alignSelf: 'center', maxWidth: '86%', flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 12, paddingVertical: 5, borderRadius: 14, backgroundColor: 'rgba(11,15,26,0.75)' },
+  cameraPillText:  { fontSize: 12, color: C.text },
 
   // Status bar
   statusBar:       { position: 'absolute', bottom: 14, left: 0, right: 0, alignItems: 'center' },
   statusText:      { fontSize: 13, fontWeight: '500', letterSpacing: 0.5 },
+  noticingText:    { fontSize: 11, color: C.textDim, marginTop: 3, textAlign: 'center' },
 
   // Controls
   controls:        { flex: 1, backgroundColor: C.surface, borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingTop: 16, paddingBottom: 12, paddingHorizontal: 20 },
@@ -327,6 +484,7 @@ const s = StyleSheet.create({
   animChipActive:  { backgroundColor: C.amberDim, borderColor: C.amber },
   animChipText:    { fontSize: 12, color: C.textDim, fontWeight: '500' },
   animChipTextActive: { color: C.amber },
+  emotionLabel:    { alignSelf: 'center', marginRight: 2 },
 
   // Main controls
   mainControls:    { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 24, marginBottom: 10 },
