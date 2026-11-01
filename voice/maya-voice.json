@@ -1,0 +1,14 @@
+{
+  "name": "Bella",
+  "voiceId": "hpp4J3VqNfWAUOO0d1Us",
+  "model": "eleven_multilingual_v2",
+  "streamModel": "eleven_flash_v2_5",
+  "settings": {
+    "stability": 0.5,
+    "similarity_boost": 0.75,
+    "style": 0.15,
+    "use_speaker_boost": true,
+    "speed": 0.92
+  },
+  "chosen": "2026-11-01, audition 2026-11-01-08-37 (preferred over Sarah)"
+}

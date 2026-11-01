@@ -30,11 +30,23 @@ const PAGE = `<!doctype html><html><head><meta name="viewport" content="width=de
 <video id="v" playsinline muted autoplay style="width:2px;height:2px"></video>
 <script type="module">
 const post = m => window.ReactNativeWebView.postMessage(JSON.stringify(m));
+// Plain-language reasons for the usual camera failures
+const REASONS = {
+  NotAllowedError:  'camera permission was refused',
+  NotReadableError: 'another app is using the camera',
+  NotFoundError:    'no front camera was found',
+  TimeoutError:     "the camera didn't start within 15 seconds",
+};
 try {
   post({ type: 'status', status: 'camera' });
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: 'user', width: { ideal: 320 }, height: { ideal: 240 } }, audio: false,
-  });
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('this WebView has no camera support');
+  // Never wait forever: if Android doesn't answer, say so
+  const stream = await Promise.race([
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 320 }, height: { ideal: 240 } }, audio: false,
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('timeout'), { name: 'TimeoutError' })), 15000)),
+  ]);
   const v = document.getElementById('v');
   v.srcObject = stream;
   await v.play();
@@ -65,7 +77,7 @@ try {
     post({ type: 'face', face: { blendshapes, roll } });
   }, ${DETECT_INTERVAL_MS});
 } catch (err) {
-  post({ type: 'error', message: String(err && err.message || err) });
+  post({ type: 'error', message: REASONS[err && err.name] || String(err && err.message || err) });
 }
 </script></body></html>`;
 

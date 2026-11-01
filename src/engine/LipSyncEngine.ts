@@ -117,8 +117,45 @@ const wordUnits = (word: string): Unit[] => {
   return units;
 };
 
+/** Text as it should be spoken: maths symbols and digits as words ("x²" → "x squared").
+ *  Used for lip sync and sent to the TTS voice, so both say the same thing. */
+export const spokenText = (text: string) => text
+  // "ax² + bx" is "a x squared plus b x", not the word "ax"
+  .replace(/\b([a-z])([xyz])(?=[²³]|\s*[+=×÷−-])/g, '$1 $2')
+  // "2x" is "two x"
+  .replace(/(\d)([a-z])\b/g, '$1 $2')
+  // a minus sign before a number or variable ("x = -3"), but not a dash between words
+  .replace(/(^|[\s(=])[-−](?=\s?[\dxyz(])/g, '$1 minus ')
+  // whole numbers as words ("14" → "fourteen"), so the voice and the mouth see the same words;
+  // thousands separators first ("1,000" is one number)
+  .replace(/(\d),(?=\d{3}\b)/g, '$1')
+  .replace(/\d+(?:\.\d+)?/g, numberWords)
+  .replace(/[+=×÷²³%]/g, ch => SPOKEN[ch] ?? ' ')
+  .replace(/\s+([,.;:?!])/g, '$1')
+  .replace(/\s{2,}/g, ' ').trim();
+
+const ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven',
+  'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+const TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+
+function integerWords(n: number): string {
+  if (n < 20) return ONES[n];
+  if (n < 100) return TENS[Math.floor(n / 10)] + (n % 10 ? '-' + ONES[n % 10] : '');
+  if (n < 1000) return ONES[Math.floor(n / 100)] + ' hundred' + (n % 100 ? ' and ' + integerWords(n % 100) : '');
+  if (n < 1_000_000) return integerWords(Math.floor(n / 1000)) + ' thousand' +
+    (n % 1000 ? (n % 1000 < 100 ? ' and ' : ' ') + integerWords(n % 1000) : '');
+  return String(n).split('').map(d => ONES[+d]).join(' ');  // very long numbers: digit by digit
+}
+
+/** "14" → "fourteen", "3.5" → "three point five" */
+function numberWords(num: string): string {
+  const [whole, decimals] = num.split('.');
+  const words = integerWords(parseInt(whole, 10));
+  return ` ${decimals ? `${words} point ${decimals.split('').map(d => ONES[+d]).join(' ')}` : words} `;
+}
+
 const textUnits = (text: string): Unit[] => {
-  const spoken = text.toLowerCase().replace(/[+=×÷²³%0-9]/g, ch => SPOKEN[ch] ?? ' ');
+  const spoken = spokenText(text).toLowerCase();
   const units: Unit[] = [];
   let syllable = 0;
   for (const token of spoken.match(/[a-z']+|[,;:.?!—]/g) ?? []) {
@@ -149,6 +186,7 @@ export class LipSyncEngine {
   private schedule:    Frame[] = [];
   private startTime:   number = 0;
   private isRunning:   boolean = false;
+  private run:         number = 0;   // bumps on every stop, so a stopped stream ignores late timings
 
   constructor(setViseme: SetVisemeFn) {
     this.setViseme = setViseme;
@@ -175,21 +213,59 @@ export class LipSyncEngine {
   }
 
   // ── Mode 2: per-character timings (seconds), e.g. from a TTS alignment ─
-  speakCharacters(chars: string[], startsSec: number[], endsSec: number[]) {
+  // `clock` (ms) lets the mouth follow the audio's playback position instead of wall time.
+  speakCharacters(chars: string[], startsSec: number[], endsSec: number[],
+                  intensity = 1, clock?: () => number) {
     this.stop();
     if (chars.length === 0) return;
-    const frames: Frame[] = [];
-
-    chars.forEach((char, i) => {
-      const start = (startsSec[i] ?? 0) * 1000;
-      const shape = charShape(char);
-      // Spaces/punctuation and B/P/M all close the mouth
-      frames.push({ time: start, weights: shape ? this.singleViseme(shape[0], shape[1]) : {} });
-    });
-
+    const frames = this.charFrames(chars, startsSec, endsSec, intensity);
     const lastEnd = (endsSec[endsSec.length - 1] ?? 0) * 1000;
     frames.push({ time: lastEnd + 80, weights: {} });
-    this.playFrames(frames);
+    this.playFrames(frames, clock);
+  }
+
+  /** Lip sync for audio that's still arriving (streamed voice): `add` timings as pieces come
+   *  in, then `end` when the audio is complete. Until then the mouth holds its last shape. */
+  speakCharacterStream(intensity = 1, clock?: () => number) {
+    this.stop();
+    const run = this.run;
+    let open = true, lastEnd = 0;
+    this.playFrames([{ time: 0, weights: {} }], clock, () => open);
+    return {
+      add: (chars: string[], startsSec: number[], endsSec: number[]) => {
+        if (run !== this.run || !chars.length) return;
+        this.schedule.push(...this.charFrames(chars, startsSec, endsSec, intensity));
+        lastEnd = Math.max(lastEnd, (endsSec[endsSec.length - 1] ?? 0) * 1000);
+      },
+      end: () => {
+        if (run !== this.run) return;
+        this.schedule.push({ time: lastEnd + 80, weights: {} });
+        open = false;
+      },
+    };
+  }
+
+  // Mouth-shape frames from per-character timings (seconds)
+  private charFrames(chars: string[], startsSec: number[], endsSec: number[], intensity: number): Frame[] {
+    const frames: Frame[] = [];
+    const text = chars.join('').toLowerCase();
+
+    for (let i = 0; i < chars.length; ) {
+      const start = (startsSec[i] ?? 0) * 1000;
+      const pair  = DIGRAPHS[text.slice(i, i + 2)];
+      const char  = text[i];
+      i += pair ? 2 : 1;
+      if (char === ' ') {
+        // Word gaps in fluent speech are a few ms: only relax the mouth on a real pause
+        const gap = ((startsSec[i] ?? endsSec[i - 1] ?? 0) - (startsSec[i - 1] ?? 0)) * 1000;
+        if (gap > 120) frames.push({ time: start, weights: {} });
+        continue;
+      }
+      const shape = pair ?? charShape(char);
+      // Punctuation and B/P/M close the mouth
+      frames.push({ time: start, weights: shape ? this.singleViseme(shape[0], Math.min(1, shape[1] * intensity)) : {} });
+    }
+    return frames;
   }
 
   // ── Mode 3: ARPAbet phoneme timestamps ───────────────────────────────
@@ -216,6 +292,7 @@ export class LipSyncEngine {
 
   // ── Stop all lip sync ─────────────────────────────────────────────────
   stop() {
+    this.run++;
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
@@ -225,7 +302,8 @@ export class LipSyncEngine {
   }
 
   // ── Internal: frame player ─────────────────────────────────────────────
-  private playFrames(frames: Frame[]) {
+  // `open`: more frames may still be added (streaming); don't finish at the last one yet
+  private playFrames(frames: Frame[], clock?: () => number, open: () => boolean = () => false) {
     if (frames.length === 0) return;
     // Frames must be in time order
     this.schedule  = [...frames].sort((a, b) => a.time - b.time);
@@ -233,17 +311,17 @@ export class LipSyncEngine {
     this.isRunning = true;
     let frameIdx    = 0;
     let lastApplied = -1;
-    const lastIdx   = this.schedule.length - 1;
 
     const tick = () => {
       if (!this.isRunning) return;
-      const elapsed = performance.now() - this.startTime;
+      const elapsed = clock ? clock() : performance.now() - this.startTime;
+      const lastIdx = this.schedule.length - 1;
 
       while (frameIdx < lastIdx && this.schedule[frameIdx + 1].time <= elapsed) {
         frameIdx++;
       }
 
-      if (frameIdx >= lastIdx) {
+      if (frameIdx >= lastIdx && !open()) {
         // Finished
         this.setViseme({});
         this.isRunning = false;
@@ -286,8 +364,8 @@ export function useLipSync() {
   }, []);
 
   const speakCharacters = useCallback(
-    (chars: string[], startsSec: number[], endsSec: number[]) => {
-      engine.current?.speakCharacters(chars, startsSec, endsSec);
+    (chars: string[], startsSec: number[], endsSec: number[], intensity?: number, clock?: () => number) => {
+      engine.current?.speakCharacters(chars, startsSec, endsSec, intensity, clock);
     },
     [],
   );
@@ -299,9 +377,13 @@ export function useLipSync() {
     [],
   );
 
+  const speakCharacterStream = useCallback((intensity?: number, clock?: () => number) => {
+    return engine.current!.speakCharacterStream(intensity, clock);
+  }, []);
+
   const stopSpeaking = useCallback(() => {
     engine.current?.stop();
   }, []);
 
-  return { speak, speakCharacters, speakPhonemes, stopSpeaking };
+  return { speak, speakCharacters, speakCharacterStream, speakPhonemes, stopSpeaking };
 }

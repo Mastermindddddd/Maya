@@ -14,17 +14,22 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, Animated, Alert,
+  View, Text, TouchableOpacity, StyleSheet, Animated, Alert, Linking,
   ScrollView, Easing, Platform, Dimensions,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { Camera } from 'expo-camera';
 import { StackNavigationProp } from '@react-navigation/stack';
 import { RouteProp } from '@react-navigation/native';
 import { RootStackParamList } from '../../App';
 
 import AvatarRenderer, { AnimationState } from '../components/AvatarRenderer';
 import LoadingOverlay from '../components/LoadingOverlay';
-import { useLipSync } from '../engine/LipSyncEngine';
+import { spokenText, useLipSync } from '../engine/LipSyncEngine';
+import { playOnBridge, say, serverUrl, stopVoice } from '../engine/tutorVoice';
+import VoiceBridgeView, { ListenerInfo, VoiceBridge } from '../components/VoiceBridge';
+import { TURN_DEFAULTS } from '../engine/turnDetector';
+import { Audio } from 'expo-av';
 import { ManualEmotionDetector, REACTIONS, StudentEmotion } from '../engine/emotion';
 import { useEmotionReactions } from '../engine/useEmotionReactions';
 import { ContextEvidence } from '../engine/contextSignals';
@@ -53,6 +58,19 @@ const { height: SCREEN_H } = Dimensions.get('window');
 
 // Prototype student lines for the mic button (until speech-to-text is wired up); they
 // exercise the context signals: a request, a confused line, the same question again, a win
+// Stand-in for the AI's first sentence (a fast streaming model takes roughly this long)
+const MOCK_AI_MS = 500;
+const MOCK_TUTOR_REPLY = "Of course! A quadratic equation has the form ax² + bx + c = 0. Let's start with a simple example — can you tell me what you already know about solving them?";
+
+// Short acknowledgements Maya says the instant the student's turn ends, while she prepares her
+// reply. Generated once (a few credits), then kept in memory by the VoiceBridge.
+const FILLERS = [
+  { id: 'mm-okay', text: 'Mm, okay.' },
+  { id: 'right',   text: 'Right.' },
+  { id: 'okay',    text: 'Okay.' },
+  { id: 'mm-hm',   text: 'Mm-hm.' },
+];
+
 const MOCK_STUDENT_LINES = [
   'Can you help me with quadratic equations?',
   "Wait, what do you mean? I don't get it.",
@@ -111,18 +129,101 @@ export default function SessionScreen({ navigation, route }: Props) {
     setStudentName(studentName);
   }, [studentName, setStudentName]);
 
-  // ── Maya speaks: transcript + talking animation + lip sync ─────────────
-  // Speech ends when the lip sync does (until real TTS audio is wired up).
-  const { speak, stopSpeaking } = useLipSync();
+  // ── Maya speaks ──────────────────────────────────────────────────────────
+  // Preferred: streamed through the VoiceBridge (plays after ~200 ms of audio, fillers ready in
+  // memory). Fallbacks: the whole line via expo-av (tutorVoice.say), then silent lip sync.
+  const { speak, speakCharacters, speakCharacterStream, stopSpeaking } = useLipSync();
+  const bridge = useMemo(() => new VoiceBridge(), []);
+  const lineId = useRef(0);
   const speechTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const tutorSays = useCallback((text: string) => {
-    addMessage({ speaker: 'tutor', text });
-    tutorStartsSpeaking();
+
+  // Response time: student stopped talking → Maya's first sound (often a filler), and → her reply
+  const studentStoppedAt = useRef<number | null>(null);
+  const firstSoundAt = useRef<number | null>(null);
+  const [latency, setLatency] = useState<{ firstSound: number; reply: number } | null>(null);
+  const noteSound = (at: number, isReply: boolean) => {
+    const stopped = studentStoppedAt.current;
+    if (stopped === null) return;
+    if (firstSoundAt.current === null) firstSoundAt.current = at;
+    if (isReply) {
+      setLatency({ firstSound: firstSoundAt.current - stopped, reply: at - stopped });
+      studentStoppedAt.current = null;
+    }
+  };
+
+  // Plays one line; resolves when it has finished, been stopped, or failed
+  const speakLine = useCallback(async (id: number, text: string) => {
     // Speak in the style of the current reaction (e.g. slower and softer when the student is frustrated)
-    const durationMs = speak(text, undefined, REACTIONS[useSessionStore.getState().tutorReaction].speech);
+    const reaction = useSessionStore.getState().tutorReaction;
+    const style = REACTIONS[reaction].speech;
+    const spoken = spokenText(text);
+
+    if (bridge.ready) {
+      const line = playOnBridge(bridge, { text: spoken, reaction }, clock => speakCharacterStream(style.intensity, clock));
+      if (line) {
+        const audibleAt = await Promise.race([line.started, line.finished.then(() => null)]);
+        if (id !== lineId.current) return;
+        if (audibleAt !== null) {
+          noteSound(audibleAt, true);
+          tutorStartsSpeaking();
+          await line.finished;
+          return;
+        }
+        // Couldn't stream (server off, over budget…): try the other ways below
+      }
+    }
+    const voiced = await say(spoken, reaction, style.intensity, speakCharacters, () => id === lineId.current);
+    if (id !== lineId.current) return;
+    noteSound(performance.now(), true);
+    tutorStartsSpeaking();
+    if (voiced) { await voiced.finished; return; }
+    const durationMs = speak(text, undefined, style);
+    await new Promise<void>(resolve => { speechTimer.current = setTimeout(resolve, durationMs + 150); });
+  }, [bridge, speak, speakCharacters, speakCharacterStream]);
+
+  // A short acknowledgement the instant the student's turn ends, while the reply is prepared
+  const lastFiller = useRef('');
+  const replyStarted = useRef(false);
+  const playFiller = useCallback((id: number) => {
+    const options = FILLERS.filter(f => f.id !== lastFiller.current && bridge.hasFiller(f.id));
+    const filler = options[Math.floor(Math.random() * options.length)];
+    if (!filler) return;
+    lastFiller.current = filler.id;
+    const line = playOnBridge(bridge, { filler: filler.id }, clock => speakCharacterStream(1, clock));
+    line?.started.then(at => {
+      if (id !== lineId.current) return;
+      noteSound(at, false);
+      tutorStartsSpeaking();
+    });
+    // Reply not ready when the filler ends: back to the thinking look rather than silent "talking"
+    line?.finished.then(() => { if (id === lineId.current && !replyStarted.current) tutorIsThinking(); });
+  }, [bridge, speakCharacterStream]);
+
+  // Maya's answer: optionally a filler straight away, then the reply (which may still be generating)
+  const respond = useCallback(async (reply: Promise<string>, withFiller: boolean) => {
+    const id = ++lineId.current;
     if (speechTimer.current) clearTimeout(speechTimer.current);
-    speechTimer.current = setTimeout(tutorFinishedSpeaking, durationMs + 150);
-  }, [addMessage, speak]);
+    firstSoundAt.current = null;
+    replyStarted.current = false;
+    if (withFiller) playFiller(id);
+    const text = await reply;
+    if (id !== lineId.current) return;
+    addMessage({ speaker: 'tutor', text });
+    replyStarted.current = true;
+    await speakLine(id, text);
+    if (id === lineId.current) tutorFinishedSpeaking();
+  }, [addMessage, playFiller, speakLine]);
+
+  const tutorSays = useCallback((text: string) => respond(Promise.resolve(text), false), [respond]);
+
+  // Load the fillers into the bridge once it's up (generated once ever, then served from the cache)
+  useEffect(() => {
+    bridge.onReady = () => {
+      const url = serverUrl();
+      if (url) FILLERS.forEach(f => bridge.preloadFiller(url, f.id, f.text));
+    };
+    return () => { bridge.onReady = undefined; };
+  }, [bridge]);
 
   // ── Student emotion → Maya's reaction ─────────────────────────────────
   // With the camera on, MediaPipe reads the student's face on the phone (EmotionCamera).
@@ -181,8 +282,24 @@ export default function SessionScreen({ navigation, route }: Props) {
       'are saved or sent anywhere. You can turn it off at any time.',
       [
         { text: 'Not now', style: 'cancel' },
-        { text: 'Turn on', onPress: () => setCameraOn(true) },
+        { text: 'Turn on', onPress: startCamera },
       ],
+    );
+  };
+  // Ask Android for the camera from the app itself before starting the WebView: the WebView
+  // then finds it already granted, instead of relying on its own permission request (which
+  // can go unanswered inside Expo Go and leave it stuck on "Starting camera…")
+  const startCamera = async () => {
+    const permission = await Camera.requestCameraPermissionsAsync().catch(() => null);
+    if (permission?.granted) { setCameraOn(true); return; }
+    Alert.alert(
+      'Camera permission needed',
+      permission?.canAskAgain === false
+        ? 'Camera access is turned off for this app. You can turn it on in Settings → Apps → Permissions.'
+        : 'Maya needs camera permission to read your expressions.',
+      permission?.canAskAgain === false
+        ? [{ text: 'Cancel', style: 'cancel' }, { text: 'Open Settings', onPress: () => Linking.openSettings() }]
+        : [{ text: 'OK' }],
     );
   };
   const cameraLabel = (() => {
@@ -202,7 +319,9 @@ export default function SessionScreen({ navigation, route }: Props) {
   useEffect(() => () => {
     if (speechTimer.current) clearTimeout(speechTimer.current);
     stopSpeaking();
-  }, [stopSpeaking]);
+    stopVoice();
+    bridge.stop();
+  }, [stopSpeaking, bridge]);
 
   // ── Mic pulse animation ───────────────────────────────────────────────
   useEffect(() => {
@@ -230,28 +349,117 @@ export default function SessionScreen({ navigation, route }: Props) {
   const handleAvatarReady = () => {
     setAvatarReady(true);
     setPhase('idle');
+    startListening();
     // Greet the student
     setTimeout(() => {
       tutorSays(`Hi ${studentName}! I'm Maya, your tutor. What are we working on today?`);
     }, 800);
   };
 
-  // ── Mic button ────────────────────────────────────────────────────────
-  const handleMicPress = () => {
-    if (!isAvatarReady) return;
-    if (phase === 'listening') {
-      // Stop listening — simulate student finishing
-      const mockStudentText = MOCK_STUDENT_LINES[mockLine.current++ % MOCK_STUDENT_LINES.length];
-      addMessage({ speaker: 'student', text: mockStudentText });
-      tutorIsThinking();
-      // Simulate LLM + TTS for prototype
-      setTimeout(() => {
-        tutorSays("Of course! A quadratic equation has the form ax² + bx + c = 0. Let's start with a simple example — can you tell me what you already know about solving them?");
-      }, 1800);
-    } else if (phase === 'idle') {
-      studentStartsSpeaking();
-    }
+  // ── The student's turn ends (mic button, or hands-free) ──────────────────
+  // Until speech-to-text and the AI are wired up, the student's words and the reply are mock ones.
+  const thinkOfReply = () => new Promise<string>(resolve => setTimeout(() => resolve(MOCK_TUTOR_REPLY), MOCK_AI_MS));
+  // A reply started early, at the first "probably done" pause (dropped if the student goes on)
+  const earlyReply = useRef<Promise<string> | null>(null);
+
+  const studentTurnEnded = useCallback((stoppedAt: number, early: Promise<string> | null = null) => {
+    studentStoppedAt.current = stoppedAt;
+    const mockStudentText = MOCK_STUDENT_LINES[mockLine.current++ % MOCK_STUDENT_LINES.length];
+    addMessage({ speaker: 'student', text: mockStudentText });
+    tutorIsThinking();
+    respond(early ?? thinkOfReply(), true);
+  }, [addMessage, respond]);
+
+  // Stop everything Maya is saying or about to say
+  const silenceMaya = useCallback(() => {
+    lineId.current++;  // anything still loading won't play
+    bridge.stop(); stopVoice(); stopSpeaking();
+    if (speechTimer.current) clearTimeout(speechTimer.current);
+    earlyReply.current = null;
+  }, [bridge, stopSpeaking]);
+
+  // ── Hands-free: Silero VAD decides when the student starts and stops talking ──
+  const [handsFree, setHandsFree] = useState(false);
+  const [listenerInfo, setListenerInfo] = useState<ListenerInfo>({ status: 'off' });
+  useEffect(() => {
+    bridge.onInfo = info => setListenerInfo(prev =>
+      prev.status === info.status && prev.error === info.error && Math.abs((prev.level ?? 0) - (info.level ?? 0)) < 2 ? prev : info);
+    bridge.onEvent = event => {
+      const phaseNow = useSessionStore.getState().phase;
+      switch (event.type) {
+        case 'bargeIn':
+          // The student talked over Maya: stop her straight away
+          silenceMaya();
+          studentStoppedAt.current = null;
+          studentStartsSpeaking();
+          break;
+        case 'speechStart':
+          // Still preparing the reply: they weren't done after all, so drop it and let them finish
+          if (phaseNow === 'thinking') { silenceMaya(); studentStoppedAt.current = null; }
+          if (phaseNow === 'idle' || phaseNow === 'thinking') studentStartsSpeaking();
+          break;
+        case 'endLikely':
+          // Probably done: start thinking of the reply now, to save the rest of the wait
+          if (phaseNow === 'listening' && !earlyReply.current) earlyReply.current = thinkOfReply();
+          break;
+        case 'resumed':
+          earlyReply.current = null;
+          break;
+        case 'endOfTurn':
+          // The student actually stopped endSilenceMs ago; that wait is part of the response time
+          if (phaseNow === 'listening') {
+            studentTurnEnded(performance.now() - TURN_DEFAULTS.endSilenceMs, earlyReply.current);
+          }
+          earlyReply.current = null;
+          break;
+        // ignored: noises, background talk
+      }
+    };
+    return () => { bridge.onEvent = undefined; bridge.onInfo = undefined; };
+  }, [bridge, silenceMaya, studentTurnEnded]);
+  // The detector needs to know when Maya talks (her voice comes back through the mic)
+  useEffect(() => bridge.setTutorSpeaking(phase === 'speaking'), [bridge, phase]);
+  useEffect(() => bridge.setListening(handsFree), [bridge, handsFree]);
+
+  // Maya listens automatically. The first time, explain why before Android asks for the microphone.
+  const [micBlocked, setMicBlocked] = useState(false);
+  const startListening = useCallback(async () => {
+    const current = await Audio.getPermissionsAsync().catch(() => null);
+    if (current?.granted) { setMicBlocked(false); setHandsFree(true); return; }
+    const ask = async () => {
+      const permission = await Audio.requestPermissionsAsync().catch(() => null);
+      if (permission?.granted) { setMicBlocked(false); setHandsFree(true); return; }
+      setMicBlocked(true);
+      if (permission?.canAskAgain === false) {
+        Alert.alert('Microphone is turned off',
+          'Maya needs the microphone to hear you. You can turn it on in Settings → Apps → Permissions.',
+          [{ text: 'Not now', style: 'cancel' }, { text: 'Open Settings', onPress: () => Linking.openSettings() }]);
+      }
+    };
+    if (current?.canAskAgain === false) return ask();
+    Alert.alert(
+      'Maya listens to you',
+      "Just talk: Maya hears when you start and stop speaking, so there's no button to press. " +
+      'The sound is analysed on this phone only: nothing is recorded or sent anywhere. ' +
+      'You can pause listening any time with 🎙 at the top.',
+      [{ text: 'Continue', onPress: ask }],
+      { cancelable: false },
+    );
+  }, []);
+  // Mute / unmute with 🎙 at the top
+  const toggleHandsFree = () => {
+    if (handsFree) setHandsFree(false);
+    else startListening();
   };
+  const listenerLabel = (() => {
+    switch (listenerInfo.status) {
+      case 'mic':   return 'Starting microphone…';
+      case 'model': return 'Loading voice detector…';
+      case 'error': return `Hands-free unavailable: ${listenerInfo.error ?? 'unknown error'}`;
+      case 'on':    return phase === 'listening' ? 'Listening… (just stop when you’re done)' : 'Hands-free on · speak any time';
+      default:      return 'Hands-free on';
+    }
+  })();
 
   const phaseInfo = PHASE_LABEL[phase] ?? PHASE_LABEL.idle;
 
@@ -284,6 +492,13 @@ export default function SessionScreen({ navigation, route }: Props) {
           </View>
           <View style={s.topRight}>
             <TouchableOpacity
+              style={[s.transcriptBtn, handsFree && s.cameraBtnOn]}
+              onPress={toggleHandsFree}
+              accessibilityLabel={handsFree ? 'Turn off hands-free' : 'Talk to Maya hands-free'}
+            >
+              <Text style={s.transcriptBtnText}>🎙</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
               style={[s.transcriptBtn, cameraOn && s.cameraBtnOn]}
               onPress={toggleCamera}
               accessibilityLabel={cameraOn ? 'Turn off expression camera' : 'Let Maya see your expressions'}
@@ -304,6 +519,15 @@ export default function SessionScreen({ navigation, route }: Props) {
           </View>
         )}
         {cameraOn && <EmotionCamera detector={cameraDetector} />}
+
+        {/* Hands-free indicator: always visible while the microphone is on */}
+        {handsFree && (
+          <View style={[s.cameraPill, { top: cameraOn ? 96 : 66 }]}>
+            <View style={[s.statusDot, { backgroundColor: listenerInfo.status === 'on' ? C.red : C.textDim }]} />
+            <Text style={s.cameraPillText} numberOfLines={1}>{listenerLabel}</Text>
+          </View>
+        )}
+        <VoiceBridgeView bridge={bridge} />
         {checkIns.showing && <CheckInCard onAnswer={checkIns.answer} onSkip={checkIns.skip} />}
 
         {/* Status label */}
@@ -314,6 +538,12 @@ export default function SessionScreen({ navigation, route }: Props) {
           {/* Why Maya is reacting, for testing and tuning */}
           {fusionInfo.emotion && fusionInfo.score >= 0.45 && !!fusionInfo.reason && (
             <Text style={s.noticingText} numberOfLines={1}>Noticing: {fusionInfo.reason}</Text>
+          )}
+          {/* Response time: student stopped talking → Maya's first sound */}
+          {latency && (
+            <Text style={s.noticingText} numberOfLines={1}>
+              ⏱ first sound {Math.round(latency.firstSound)} ms · reply {Math.round(latency.reply)} ms (after the student stopped)
+            </Text>
           )}
         </View>
       </View>
@@ -409,16 +639,25 @@ export default function SessionScreen({ navigation, route }: Props) {
             <Text style={s.sideBtnText}>🎉</Text>
           </TouchableOpacity>
 
-          {/* Mic button */}
-          <Animated.View style={{ transform: [{ scale: micPulse }] }}>
-            <TouchableOpacity
-              style={[s.micBtn, phase === 'listening' && s.micBtnActive, !isAvatarReady && s.micBtnDisabled]}
-              onPress={handleMicPress}
-              disabled={!isAvatarReady || phase === 'thinking' || phase === 'speaking'}
+          {/* Listening indicator (no button: Maya hears when you start and stop talking) */}
+          <View style={s.listenIndicator}>
+            <Animated.View
+              style={[s.micBtn, { transform: [{ scale: micPulse }] },
+                phase === 'listening' && s.micBtnActive,
+                (!handsFree || listenerInfo.status !== 'on') && s.micBtnDisabled]}
+              accessibilityLabel={handsFree ? 'Maya is listening' : 'Listening is paused'}
             >
-              <Text style={s.micIcon}>{phase === 'listening' ? '⏹' : '🎤'}</Text>
-            </TouchableOpacity>
-          </Animated.View>
+              <Text style={s.micIcon}>{handsFree ? '🎙' : '🔇'}</Text>
+            </Animated.View>
+            {/* How loud the microphone hears you: shows it's working */}
+            <View style={s.levelRow}>
+              {[0, 1, 2, 3, 4].map(i => {
+                const lit = handsFree && listenerInfo.status === 'on' &&
+                  ((listenerInfo.level ?? -100) + 65) / 9 > i;   // -65 dB … -20 dB over five bars
+                return <View key={i} style={[s.levelBar, { height: 4 + i * 2 }, lit && s.levelBarLit]} />;
+              })}
+            </View>
+          </View>
 
           {/* Nod shortcut */}
           <TouchableOpacity style={s.sideBtn} onPress={() => tutorNods()}>
@@ -428,10 +667,14 @@ export default function SessionScreen({ navigation, route }: Props) {
         </View>
 
         <Text style={s.hint}>
-          {phase === 'idle'      ? 'Tap the mic to speak'           :
-           phase === 'listening' ? 'Tap again when done speaking'   :
-           phase === 'thinking'  ? 'Maya is preparing a response…'  :
-           phase === 'speaking'  ? 'Maya is explaining…'            : ''}
+          {micBlocked                         ? 'Maya can’t hear you: allow the microphone (🎙 at the top)' :
+           !handsFree                         ? 'Listening is paused — tap 🎙 at the top to resume'      :
+           listenerInfo.status === 'error'    ? `Maya can’t hear you: ${listenerInfo.error ?? 'microphone problem'}` :
+           listenerInfo.status !== 'on'       ? 'Getting ready to listen…'                               :
+           phase === 'idle'                   ? 'Just talk — Maya is listening'                          :
+           phase === 'listening'              ? 'Listening… just stop when you’re done'                  :
+           phase === 'thinking'               ? 'Maya is thinking…'                                      :
+           phase === 'speaking'               ? 'Maya is talking (you can interrupt her)'                : ''}
         </Text>
 
       </View>
@@ -491,6 +734,10 @@ const s = StyleSheet.create({
   micBtn:          { width: 72, height: 72, borderRadius: 36, backgroundColor: C.amber, alignItems: 'center', justifyContent: 'center', shadowColor: C.amber, shadowOpacity: 0.4, shadowRadius: 16, shadowOffset: { width: 0, height: 4 }, elevation: 8 },
   micBtnActive:    { backgroundColor: C.red, shadowColor: C.red },
   micBtnDisabled:  { opacity: 0.4 },
+  listenIndicator: { alignItems: 'center', gap: 6 },
+  levelRow:        { flexDirection: 'row', alignItems: 'flex-end', gap: 3, height: 14 },
+  levelBar:        { width: 4, borderRadius: 2, backgroundColor: C.border },
+  levelBarLit:     { backgroundColor: C.teal },
   micIcon:         { fontSize: 28 },
   sideBtn:         { width: 50, height: 50, borderRadius: 25, backgroundColor: C.bg, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' },
   sideBtnText:     { fontSize: 22 },

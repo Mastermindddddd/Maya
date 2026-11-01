@@ -44,3 +44,8 @@ training/data/
 training/exports/
 training/.venv/
 training/__pycache__/
+
+# Voice design: API key and generated audio
+voice/.env
+voice/auditions/
+voice/cache/
